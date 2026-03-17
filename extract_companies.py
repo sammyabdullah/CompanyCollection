@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sys
+import time
 from urllib.parse import urljoin
 
 import anthropic
@@ -109,17 +110,31 @@ Rules:
 
 Respond with the JSON array only — no explanation, no markdown fences."""
 
-    with client.messages.stream(
+    response = call_claude_with_retry(
+        client,
         model="claude-opus-4-6",
         max_tokens=4096,
         thinking={"type": "adaptive"},
         messages=[{"role": "user", "content": prompt}],
-    ) as stream:
-        response = stream.get_final_message()
+    )
 
     raw = next((b.text for b in response.content if b.type == "text"), "[]")
     result = extract_json(raw, array=True)
     return result if isinstance(result, list) else []
+
+
+def call_claude_with_retry(client: anthropic.Anthropic, max_retries: int = 4, **kwargs) -> anthropic.types.Message:
+    """Call client.messages.create with exponential backoff on timeout/connection errors."""
+    delays = [2, 4, 8, 16]
+    for attempt in range(max_retries + 1):
+        try:
+            return client.messages.create(**kwargs)
+        except (anthropic.APITimeoutError, anthropic.APIConnectionError) as e:
+            if attempt == max_retries:
+                raise
+            wait = delays[attempt]
+            print(f"    API error ({e.__class__.__name__}), retrying in {wait}s...", file=sys.stderr)
+            time.sleep(wait)
 
 
 def get_founder_info(
@@ -170,12 +185,12 @@ If the founder is truly unknown, use empty strings.
 
 Example: {{"first_name": "Brian", "last_name": "Chesky"}}"""
 
-    with client.messages.stream(
+    response = call_claude_with_retry(
+        client,
         model="claude-opus-4-6",
         max_tokens=256,
         messages=[{"role": "user", "content": prompt}],
-    ) as stream:
-        response = stream.get_final_message()
+    )
 
     raw = next((b.text for b in response.content if b.type == "text"), "{}")
     data = extract_json(raw, array=False)
@@ -250,32 +265,52 @@ def main():
         print("No tech companies found. Exiting.")
         sys.exit(0)
 
-    rows = []
-    for i, company in enumerate(all_companies, 1):
-        name = company.get("company_name", "")
-        url = company.get("company_url", "")
-        first, last = "", ""
+    fieldnames = ["company_name", "company_url", "founder_first_name", "founder_last_name"]
 
-        if not args.no_founders and url:
-            print(f"  [{i}/{len(all_companies)}] Looking up founder for {name}...")
-            first, last = get_founder_info(url, name, client)
+    # Load checkpoint: any rows already written to the output CSV
+    completed_urls: set[str] = set()
+    if os.path.exists(args.output):
+        with open(args.output, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                completed_urls.add(row.get("company_url", "").rstrip("/").lower())
+        if completed_urls:
+            print(f"Resuming: {len(completed_urls)} companies already done, skipping them.")
 
-        rows.append(
-            {
+    # Open output in append mode so we resume where we left off
+    write_header = not os.path.exists(args.output) or os.path.getsize(args.output) == 0
+    out_f = open(args.output, "a", newline="", encoding="utf-8")
+    writer = csv.DictWriter(out_f, fieldnames=fieldnames)
+    if write_header:
+        writer.writeheader()
+        out_f.flush()
+
+    try:
+        for i, company in enumerate(all_companies, 1):
+            name = company.get("company_name", "")
+            url = company.get("company_url", "")
+            url_key = url.rstrip("/").lower()
+
+            if url_key in completed_urls:
+                print(f"  [{i}/{len(all_companies)}] Skipping {name} (already done)")
+                continue
+
+            first, last = "", ""
+            if not args.no_founders and url:
+                print(f"  [{i}/{len(all_companies)}] Looking up founder for {name}...")
+                first, last = get_founder_info(url, name, client)
+
+            row = {
                 "company_name": name,
                 "company_url": url,
                 "founder_first_name": first,
                 "founder_last_name": last,
             }
-        )
-
-    with open(args.output, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["company_name", "company_url", "founder_first_name", "founder_last_name"],
-        )
-        writer.writeheader()
-        writer.writerows(rows)
+            writer.writerow(row)
+            out_f.flush()
+            completed_urls.add(url_key)
+    finally:
+        out_f.close()
 
     print(f"\nDone. Results saved to: {args.output}")
     print(f"Columns: company_name, company_url, founder_first_name, founder_last_name")
