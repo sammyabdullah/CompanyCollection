@@ -124,11 +124,18 @@ Respond with the JSON array only — no explanation, no markdown fences."""
 
 
 def call_claude_with_retry(client: anthropic.Anthropic, max_retries: int = 4, **kwargs) -> anthropic.types.Message:
-    """Call client.messages.create with exponential backoff on timeout/connection errors."""
+    """Call client.messages.create with exponential backoff on timeout/connection/rate-limit errors."""
     delays = [2, 4, 8, 16]
+    rate_limit_delays = [60, 90, 120, 180]
     for attempt in range(max_retries + 1):
         try:
             return client.messages.create(**kwargs)
+        except anthropic.RateLimitError as e:
+            if attempt == max_retries:
+                raise
+            wait = rate_limit_delays[attempt]
+            print(f"    Rate limit hit, waiting {wait}s before retry...", file=sys.stderr)
+            time.sleep(wait)
         except (anthropic.APITimeoutError, anthropic.APIConnectionError) as e:
             if attempt == max_retries:
                 raise
