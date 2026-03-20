@@ -8,7 +8,7 @@ Usage:
     python extract_companies.py page.html --no-founders --output companies.csv
 
 Outputs a CSV with columns:
-    company_name, company_url, founder_first_name, founder_last_name
+    company_name, company_url, founder_first_name, founder_last_name, source_url
 
 Requires: ANTHROPIC_API_KEY environment variable
 """
@@ -206,6 +206,14 @@ Example: {{"first_name": "Brian", "last_name": "Chesky"}}"""
     return "", ""
 
 
+def clean_url(url: str, max_len: int = 20) -> str:
+    """Strip protocol/www and truncate to max_len characters."""
+    url = re.sub(r"^https?://", "", url)
+    url = re.sub(r"^www\.", "", url)
+    url = url.rstrip("/")
+    return url[:max_len]
+
+
 def deduplicate(companies: list[dict]) -> list[dict]:
     """Remove duplicate company URLs, keeping the first occurrence."""
     seen_urls = set()
@@ -263,6 +271,8 @@ def main():
         print("  Identifying tech companies via Claude...")
         companies = identify_tech_companies(html, base_url, source, client)
         print(f"  Found {len(companies)} tech companies.")
+        for c in companies:
+            c["source_url"] = clean_url(source)
         all_companies.extend(companies)
 
     all_companies = deduplicate(all_companies)
@@ -272,7 +282,7 @@ def main():
         print("No tech companies found. Exiting.")
         sys.exit(0)
 
-    fieldnames = ["company_name", "company_url", "founder_first_name", "founder_last_name"]
+    fieldnames = ["company_name", "company_url", "founder_first_name", "founder_last_name", "source_url"]
 
     # Load checkpoint: any rows already written to the output CSV
     completed_urls: set[str] = set()
@@ -280,7 +290,7 @@ def main():
         with open(args.output, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                completed_urls.add(row.get("company_url", "").rstrip("/").lower())
+                completed_urls.add(row.get("company_url", "").lower())
         if completed_urls:
             print(f"Resuming: {len(completed_urls)} companies already done, skipping them.")
 
@@ -296,7 +306,7 @@ def main():
         for i, company in enumerate(all_companies, 1):
             name = company.get("company_name", "")
             url = company.get("company_url", "")
-            url_key = url.rstrip("/").lower()
+            url_key = clean_url(url).lower()
 
             if url_key in completed_urls:
                 print(f"  [{i}/{len(all_companies)}] Skipping {name} (already done)")
@@ -309,9 +319,10 @@ def main():
 
             row = {
                 "company_name": name,
-                "company_url": url,
+                "company_url": clean_url(url),
                 "founder_first_name": first,
                 "founder_last_name": last,
+                "source_url": company.get("source_url", ""),
             }
             writer.writerow(row)
             out_f.flush()
@@ -320,7 +331,7 @@ def main():
         out_f.close()
 
     print(f"\nDone. Results saved to: {args.output}")
-    print(f"Columns: company_name, company_url, founder_first_name, founder_last_name")
+    print(f"Columns: company_name, company_url, founder_first_name, founder_last_name, source_url")
 
 
 if __name__ == "__main__":
