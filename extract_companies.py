@@ -206,12 +206,11 @@ Example: {{"first_name": "Brian", "last_name": "Chesky"}}"""
     return "", ""
 
 
-def clean_url(url: str, max_len: int = 20) -> str:
-    """Strip protocol/www and truncate to max_len characters."""
+def clean_url(url: str) -> str:
+    """Strip protocol/www and return only the domain (stop at first '/')."""
     url = re.sub(r"^https?://", "", url)
     url = re.sub(r"^www\.", "", url)
-    url = url.rstrip("/")
-    return url[:max_len]
+    return url.split("/")[0]
 
 
 def deduplicate(companies: list[dict]) -> list[dict]:
