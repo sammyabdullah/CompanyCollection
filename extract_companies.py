@@ -27,12 +27,29 @@ import requests
 from bs4 import BeautifulSoup
 
 
+def _playwright_proxy_kwargs() -> dict:
+    """Build Playwright proxy kwargs from HTTP_PROXY / HTTPS_PROXY env vars, if set."""
+    from urllib.parse import urlparse
+
+    raw = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or ""
+    if not raw:
+        return {}
+    parsed = urlparse(raw)
+    proxy: dict = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+    if parsed.username:
+        proxy["username"] = parsed.username
+    if parsed.password:
+        proxy["password"] = parsed.password
+    return {"proxy": proxy}
+
+
 def _fetch_with_playwright(url: str) -> str:
     """Render a URL with a headless Chromium browser and return the HTML."""
     from playwright.sync_api import sync_playwright
 
+    proxy_kwargs = _playwright_proxy_kwargs()
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, **proxy_kwargs)
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -121,15 +138,63 @@ def extract_json(text: str, array: bool = True) -> list | dict | None:
     return [] if array else {}
 
 
+def _find_external_company_url(detail_html: str, detail_url: str) -> str:
+    """Given the HTML of a VC company-detail page, return the company's own external URL, or ''."""
+    from urllib.parse import urlparse
+
+    detail_host = urlparse(detail_url).netloc
+    soup = BeautifulSoup(detail_html, "lxml")
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+            continue
+        full = urljoin(detail_url, href)
+        parsed = urlparse(full)
+        if parsed.scheme in ("http", "https") and parsed.netloc != detail_host:
+            # Skip common non-company links
+            skip = ("twitter.com", "x.com", "linkedin.com", "facebook.com",
+                    "instagram.com", "youtube.com", "crunchbase.com", "angel.co")
+            if not any(s in parsed.netloc for s in skip):
+                return full
+    return ""
+
+
+def _resolve_detail_pages(
+    detail_links: list[dict], base_host: str, source_label: str
+) -> list[dict]:
+    """Follow each internal company-detail link and scrape the real company URL from it."""
+    from urllib.parse import urlparse
+
+    results = []
+    for item in detail_links:
+        detail_url = item["detail_url"]
+        company_name = item["company_name"]
+        try:
+            html, _ = fetch_page(detail_url)
+            ext_url = _find_external_company_url(html, detail_url)
+            if ext_url:
+                results.append({"company_name": company_name, "company_url": ext_url})
+                print(f"    {company_name} -> {ext_url}", file=sys.stderr)
+            else:
+                print(f"    {company_name}: no external URL found on detail page", file=sys.stderr)
+        except Exception as e:
+            print(f"    Could not load detail page for {company_name}: {e}", file=sys.stderr)
+    return results
+
+
 def identify_tech_companies(
     html: str, base_url: str, source_label: str, client: anthropic.Anthropic
 ) -> list[dict]:
     """Ask Claude which links on this page lead to tech companies."""
+    from urllib.parse import urlparse
+
     page_text, links = page_text_and_links(html, base_url)
 
     if not links:
         print(f"  No links found in {source_label}", file=sys.stderr)
         return []
+
+    base_host = urlparse(base_url).netloc
 
     prompt = f"""You are a research assistant. I have a web page that lists tech companies.
 
@@ -139,16 +204,22 @@ Page text (truncated):
 All links found on the page (up to 300):
 {json.dumps(links[:300], indent=2)}
 
-Task: Identify every link that points directly to a tech company's own website.
+Task: Identify every company listed on this page.
+
+For each company, determine which kind of link is available:
+- TYPE A: a direct link to the company's own external website (e.g. https://stripe.com)
+- TYPE B: an internal link to a company-detail page on THIS same site (e.g. /companies/stripe or /rebels/ribbit)
+
 Return ONLY a JSON array. Each element must have:
   - "company_name": the company's name (string)
-  - "company_url": the company's website URL (string)
+  - "company_url": for TYPE A, the company's own website URL; for TYPE B, leave as ""
+  - "detail_url": for TYPE B, the full URL of the internal detail page; for TYPE A, leave as ""
 
 Rules:
-- Only include links that go to the company's own site (not news articles, not social media profiles, not investor pages about the company).
-- If the anchor text or surrounding context makes the company name clear, use it. Otherwise infer from the domain.
-- Skip duplicate companies.
-- If no tech company links are found, return [].
+- Do not include navigation links, blog posts, social media profiles, or news articles.
+- If a company has both types, prefer TYPE A.
+- Skip duplicates.
+- If no companies are found, return [].
 
 Respond with the JSON array only — no explanation, no markdown fences."""
 
@@ -162,7 +233,23 @@ Respond with the JSON array only — no explanation, no markdown fences."""
 
     raw = next((b.text for b in response.content if b.type == "text"), "[]")
     result = extract_json(raw, array=True)
-    return result if isinstance(result, list) else []
+    if not isinstance(result, list):
+        return []
+
+    # Split into direct hits and detail pages that need follow-up
+    direct = [c for c in result if c.get("company_url")]
+    needs_detail = [c for c in result if not c.get("company_url") and c.get("detail_url")]
+
+    if needs_detail:
+        print(f"  Following {len(needs_detail)} company detail pages...", file=sys.stderr)
+        resolved = _resolve_detail_pages(needs_detail, base_host, source_label)
+        direct.extend(resolved)
+
+    # Normalise: drop detail_url key from output
+    for c in direct:
+        c.pop("detail_url", None)
+
+    return direct
 
 
 def call_claude_with_retry(client: anthropic.Anthropic, max_retries: int = 4, **kwargs) -> anthropic.types.Message:
