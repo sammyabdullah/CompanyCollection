@@ -206,12 +206,23 @@ def _resolve_detail_pages(
 
 
 def identify_tech_companies(
-    html: str, base_url: str, source_label: str, client: anthropic.Anthropic
+    html: str, base_url: str, source_label: str, client: anthropic.Anthropic,
+    debug: bool = False,
 ) -> list[dict]:
     """Ask Claude which links on this page lead to tech companies."""
     from urllib.parse import urlparse
 
     page_text, links = page_text_and_links(html, base_url)
+
+    if debug:
+        print(f"\n[DEBUG] HTML length: {len(html)} chars", file=sys.stderr)
+        print(f"[DEBUG] Visible text length: {len(page_text)} chars", file=sys.stderr)
+        print(f"[DEBUG] Text preview:\n{page_text[:500]}\n", file=sys.stderr)
+        print(f"[DEBUG] Links found: {len(links)}", file=sys.stderr)
+        for lnk in links[:30]:
+            print(f"  {lnk}", file=sys.stderr)
+        if len(links) > 30:
+            print(f"  ... and {len(links) - 30} more", file=sys.stderr)
 
     if not links:
         print(f"  No links found in {source_label}", file=sys.stderr)
@@ -255,6 +266,8 @@ Respond with the JSON array only — no explanation, no markdown fences."""
     )
 
     raw = next((b.text for b in response.content if b.type == "text"), "[]")
+    if debug:
+        print(f"\n[DEBUG] Claude raw response:\n{raw[:2000]}\n", file=sys.stderr)
     result = extract_json(raw, array=True)
     if not isinstance(result, list):
         return []
@@ -262,6 +275,8 @@ Respond with the JSON array only — no explanation, no markdown fences."""
     # Split into direct hits and detail pages that need follow-up
     direct = [c for c in result if c.get("company_url")]
     needs_detail = [c for c in result if not c.get("company_url") and c.get("detail_url")]
+    if debug:
+        print(f"[DEBUG] Claude identified {len(direct)} direct URLs, {len(needs_detail)} detail pages", file=sys.stderr)
 
     if needs_detail:
         print(f"  Following {len(needs_detail)} company detail pages...", file=sys.stderr)
@@ -400,6 +415,11 @@ def main():
         action="store_true",
         help="Skip founder lookup (faster, columns will be empty).",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print fetched HTML length, extracted links, and Claude responses.",
+    )
     args = parser.parse_args()
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -420,7 +440,7 @@ def main():
             continue
 
         print("  Identifying tech companies via Claude...")
-        companies = identify_tech_companies(html, base_url, source, client)
+        companies = identify_tech_companies(html, base_url, source, client, debug=args.debug)
         print(f"  Found {len(companies)} tech companies.")
         for c in companies:
             c["source_url"] = clean_url(source)
