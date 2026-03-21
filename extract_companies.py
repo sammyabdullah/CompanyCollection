@@ -27,21 +27,63 @@ import requests
 from bs4 import BeautifulSoup
 
 
+def _fetch_with_playwright(url: str) -> str:
+    """Render a URL with a headless Chromium browser and return the HTML."""
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        )
+        page = context.new_page()
+        page.goto(url, wait_until="networkidle", timeout=30000)
+        html = page.content()
+        browser.close()
+    return html
+
+
+def _looks_empty(html: str) -> bool:
+    """Return True if the page appears to be an unrendered JS shell."""
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    text = soup.get_text(separator=" ", strip=True)
+    return len(text) < 200
+
+
 def fetch_page(source: str) -> tuple[str, str]:
-    """Return (html_content, base_url) for a local file or URL."""
+    """Return (html_content, base_url) for a local file or URL.
+
+    For URLs, tries requests first; falls back to Playwright if the response
+    is blocked (4xx) or the page looks like an unrendered JS shell.
+    """
     if os.path.exists(source):
         with open(source, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
         base_url = "file://" + os.path.abspath(source)
         return content, base_url
 
-    resp = requests.get(
-        source,
-        timeout=15,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; CompanyExtractor/1.0)"},
-    )
-    resp.raise_for_status()
-    return resp.text, source
+    try:
+        resp = requests.get(
+            source,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; CompanyExtractor/1.0)"},
+        )
+        resp.raise_for_status()
+        html = resp.text
+    except Exception:
+        html = ""
+
+    if not html or _looks_empty(html):
+        print("  Static fetch returned little content; retrying with Playwright...", file=sys.stderr)
+        html = _fetch_with_playwright(source)
+
+    return html, source
 
 
 def page_text_and_links(html: str, base_url: str) -> tuple[str, list[dict]]:
