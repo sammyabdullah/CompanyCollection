@@ -44,7 +44,7 @@ def _playwright_proxy_kwargs() -> dict:
 
 
 def _fetch_with_playwright(url: str) -> str:
-    """Render a URL with a headless Chromium browser and return the HTML."""
+    """Render a URL with a headless Chromium browser, scroll to load lazy content, return HTML."""
     from playwright.sync_api import sync_playwright
 
     proxy_kwargs = _playwright_proxy_kwargs()
@@ -55,10 +55,23 @@ def _fetch_with_playwright(url: str) -> str:
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
-            )
+            ),
+            viewport={"width": 1280, "height": 900},
         )
         page = context.new_page()
-        page.goto(url, wait_until="networkidle", timeout=30000)
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+        # Scroll incrementally to trigger lazy-loading on portfolio pages
+        for _ in range(10):
+            page.evaluate("window.scrollBy(0, window.innerHeight)")
+            page.wait_for_timeout(400)
+
+        # Final wait for any network activity triggered by scrolling
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+
         html = page.content()
         browser.close()
     return html
@@ -138,40 +151,50 @@ def extract_json(text: str, array: bool = True) -> list | dict | None:
     return [] if array else {}
 
 
-def _find_external_company_url(detail_html: str, detail_url: str) -> str:
-    """Given the HTML of a VC company-detail page, return the company's own external URL, or ''."""
-    from urllib.parse import urlparse
-
-    detail_host = urlparse(detail_url).netloc
+def _find_external_company_url(
+    detail_html: str, detail_url: str, company_name: str, client: anthropic.Anthropic
+) -> str:
+    """Ask Claude to identify the company's own website URL from its VC detail page."""
+    _, links = page_text_and_links(detail_html, detail_url)
     soup = BeautifulSoup(detail_html, "lxml")
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
-            continue
-        full = urljoin(detail_url, href)
-        parsed = urlparse(full)
-        if parsed.scheme in ("http", "https") and parsed.netloc != detail_host:
-            # Skip common non-company links
-            skip = ("twitter.com", "x.com", "linkedin.com", "facebook.com",
-                    "instagram.com", "youtube.com", "crunchbase.com", "angel.co")
-            if not any(s in parsed.netloc for s in skip):
-                return full
-    return ""
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    page_text = soup.get_text(separator="\n", strip=True)
+
+    prompt = f"""This is a VC investor's detail page for the portfolio company "{company_name}".
+
+Page text:
+{page_text[:3000]}
+
+Links on this page:
+{json.dumps(links[:100], indent=2)}
+
+What is the company's own external website URL (e.g. https://stripe.com)?
+Return ONLY a JSON object: {{"url": "https://..."}}
+If you cannot determine it, return {{"url": ""}}"""
+
+    response = call_claude_with_retry(
+        client,
+        model="claude-opus-4-6",
+        max_tokens=256,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = next((b.text for b in response.content if b.type == "text"), "{}")
+    data = extract_json(raw, array=False)
+    return data.get("url", "") if isinstance(data, dict) else ""
 
 
 def _resolve_detail_pages(
-    detail_links: list[dict], base_host: str, source_label: str
+    detail_links: list[dict], base_host: str, source_label: str, client: anthropic.Anthropic
 ) -> list[dict]:
     """Follow each internal company-detail link and scrape the real company URL from it."""
-    from urllib.parse import urlparse
-
     results = []
     for item in detail_links:
         detail_url = item["detail_url"]
         company_name = item["company_name"]
         try:
             html, _ = fetch_page(detail_url)
-            ext_url = _find_external_company_url(html, detail_url)
+            ext_url = _find_external_company_url(html, detail_url, company_name, client)
             if ext_url:
                 results.append({"company_name": company_name, "company_url": ext_url})
                 print(f"    {company_name} -> {ext_url}", file=sys.stderr)
@@ -242,7 +265,7 @@ Respond with the JSON array only — no explanation, no markdown fences."""
 
     if needs_detail:
         print(f"  Following {len(needs_detail)} company detail pages...", file=sys.stderr)
-        resolved = _resolve_detail_pages(needs_detail, base_host, source_label)
+        resolved = _resolve_detail_pages(needs_detail, base_host, source_label, client)
         direct.extend(resolved)
 
     # Normalise: drop detail_url key from output
