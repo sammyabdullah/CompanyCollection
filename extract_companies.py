@@ -112,6 +112,16 @@ def fetch_page(source: str) -> tuple[str, str]:
     if not html or _looks_empty(html):
         print("  Static fetch returned little content; retrying with Playwright...", file=sys.stderr)
         html = _fetch_with_playwright(source)
+    else:
+        # Even if page text looks fine, JS may not have rendered links yet.
+        # Re-fetch with Playwright if almost no links were found.
+        from bs4 import BeautifulSoup as _BS
+        _soup = _BS(html, "lxml")
+        _link_count = len([a for a in _soup.find_all("a", href=True)
+                           if not a["href"].strip().startswith(("#", "mailto:", "tel:", "javascript:"))])
+        if _link_count <= 5:
+            print("  Static fetch found very few links; retrying with Playwright...", file=sys.stderr)
+            html = _fetch_with_playwright(source)
 
     return html, source
 
@@ -225,7 +235,7 @@ def identify_tech_companies(
             print(f"  ... and {len(links) - 30} more", file=sys.stderr)
 
     if not links:
-        print(f"  No links found in {source_label}", file=sys.stderr)
+        print(f"  No links found in {source_label} even after Playwright; skipping.", file=sys.stderr)
         return []
 
     base_host = urlparse(base_url).netloc
@@ -243,17 +253,15 @@ Task: Identify every company listed on this page.
 For each company, determine which kind of link is available:
 - TYPE A: a direct link to the company's own external website (e.g. https://stripe.com)
 - TYPE B: an internal link to a company-detail page on THIS same site (e.g. /companies/stripe or /rebels/ribbit)
-- TYPE C: no link on the page — use your own knowledge to supply the company's website URL
 
 Return ONLY a JSON array. Each element must have:
   - "company_name": the company's name (string)
-  - "company_url": for TYPE A or TYPE C, the company's own website URL; for TYPE B, leave as ""
-  - "detail_url": for TYPE B, the full URL of the internal detail page; for TYPE A/C, leave as ""
+  - "company_url": for TYPE A, the company's own website URL; for TYPE B, leave as ""
+  - "detail_url": for TYPE B, the full URL of the internal detail page; for TYPE A, leave as ""
 
 Rules:
 - Do not include navigation links, blog posts, social media profiles, or news articles.
-- If a company has both TYPE A and TYPE B, prefer TYPE A.
-- For TYPE C, provide your best-known URL (e.g. https://affirm.com). If you truly don't know, leave company_url as "".
+- If a company has both types, prefer TYPE A.
 - Skip duplicates.
 - If no companies are found, return [].
 
