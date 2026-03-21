@@ -243,15 +243,17 @@ Task: Identify every company listed on this page.
 For each company, determine which kind of link is available:
 - TYPE A: a direct link to the company's own external website (e.g. https://stripe.com)
 - TYPE B: an internal link to a company-detail page on THIS same site (e.g. /companies/stripe or /rebels/ribbit)
+- TYPE C: no link on the page — use your own knowledge to supply the company's website URL
 
 Return ONLY a JSON array. Each element must have:
   - "company_name": the company's name (string)
-  - "company_url": for TYPE A, the company's own website URL; for TYPE B, leave as ""
-  - "detail_url": for TYPE B, the full URL of the internal detail page; for TYPE A, leave as ""
+  - "company_url": for TYPE A or TYPE C, the company's own website URL; for TYPE B, leave as ""
+  - "detail_url": for TYPE B, the full URL of the internal detail page; for TYPE A/C, leave as ""
 
 Rules:
 - Do not include navigation links, blog posts, social media profiles, or news articles.
-- If a company has both types, prefer TYPE A.
+- If a company has both TYPE A and TYPE B, prefer TYPE A.
+- For TYPE C, provide your best-known URL (e.g. https://affirm.com). If you truly don't know, leave company_url as "".
 - Skip duplicates.
 - If no companies are found, return [].
 
