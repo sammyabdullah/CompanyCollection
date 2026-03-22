@@ -43,8 +43,12 @@ def _playwright_proxy_kwargs() -> dict:
     return {"proxy": proxy}
 
 
-def _fetch_with_playwright(url: str) -> str:
-    """Render a URL with a headless Chromium browser, scroll to load lazy content, return HTML."""
+def _fetch_with_playwright(url: str, fast: bool = False) -> str:
+    """Render a URL with a headless Chromium browser and return HTML.
+
+    fast=True: quick load for individual company pages (domcontentloaded, no scrolling).
+    fast=False: full load for portfolio listing pages (networkidle + scroll passes).
+    """
     from playwright.sync_api import sync_playwright
 
     proxy_kwargs = _playwright_proxy_kwargs()
@@ -59,25 +63,29 @@ def _fetch_with_playwright(url: str) -> str:
             viewport={"width": 1280, "height": 900},
         )
         page = context.new_page()
-        page.goto(url, wait_until="networkidle", timeout=45000)
 
-        # Scroll incrementally to trigger lazy-loading on portfolio pages
-        for _ in range(20):
-            page.evaluate("window.scrollBy(0, window.innerHeight)")
-            page.wait_for_timeout(600)
+        if fast:
+            page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        else:
+            page.goto(url, wait_until="networkidle", timeout=45000)
 
-        # Second pass: scroll back to top then all the way down to catch any remaining lazy loads
-        page.evaluate("window.scrollTo(0, 0)")
-        page.wait_for_timeout(500)
-        for _ in range(20):
-            page.evaluate("window.scrollBy(0, window.innerHeight)")
-            page.wait_for_timeout(400)
+            # Scroll incrementally to trigger lazy-loading on portfolio pages
+            for _ in range(20):
+                page.evaluate("window.scrollBy(0, window.innerHeight)")
+                page.wait_for_timeout(600)
 
-        # Final wait for any network activity triggered by scrolling
-        try:
-            page.wait_for_load_state("networkidle", timeout=10000)
-        except Exception:
-            pass
+            # Second pass: scroll back to top then all the way down to catch any remaining lazy loads
+            page.evaluate("window.scrollTo(0, 0)")
+            page.wait_for_timeout(500)
+            for _ in range(20):
+                page.evaluate("window.scrollBy(0, window.innerHeight)")
+                page.wait_for_timeout(400)
+
+            # Final wait for any network activity triggered by scrolling
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
 
         html = page.content()
         browser.close()
@@ -93,11 +101,11 @@ def _looks_empty(html: str) -> bool:
     return len(text) < 200
 
 
-def fetch_page(source: str) -> tuple[str, str]:
+def fetch_page(source: str, fast: bool = False) -> tuple[str, str]:
     """Return (html_content, base_url) for a local file or URL.
 
-    Local files are read directly. Web URLs always use Playwright so that
-    JS-rendered portfolio pages load fully before we extract links.
+    Local files are read directly. Web URLs always use Playwright.
+    Pass fast=True for individual company pages (founder/detail lookups).
     """
     if os.path.exists(source):
         with open(source, "r", encoding="utf-8", errors="ignore") as f:
@@ -106,7 +114,7 @@ def fetch_page(source: str) -> tuple[str, str]:
         return content, base_url
 
     print("  Fetching with Playwright...", file=sys.stderr)
-    html = _fetch_with_playwright(source)
+    html = _fetch_with_playwright(source, fast=fast)
     return html, source
 
 
@@ -198,7 +206,7 @@ def _resolve_detail_pages(
         detail_url = item["detail_url"]
         company_name = item["company_name"]
         try:
-            html, _ = fetch_page(detail_url)
+            html, _ = fetch_page(detail_url, fast=True)
             ext_url = _find_external_company_url(html, detail_url, company_name, client)
             if ext_url:
                 results.append({"company_name": company_name, "company_url": ext_url})
@@ -208,6 +216,39 @@ def _resolve_detail_pages(
         except Exception as e:
             print(f"    Could not load detail page for {company_name}: {e}", file=sys.stderr)
     return results
+
+
+def _resolve_name_only(
+    name_only: list[dict], client: anthropic.Anthropic
+) -> list[dict]:
+    """Ask Claude to supply website URLs for companies identified by name only (no links on page)."""
+    names = [c["company_name"] for c in name_only]
+    prompt = f"""For each of the following tech companies, provide their primary website URL.
+
+Companies:
+{json.dumps(names, indent=2)}
+
+Return ONLY a JSON array. Each element must have:
+  - "company_name": exactly as given above
+  - "company_url": the company's homepage URL (e.g. "https://stripe.com")
+
+If you don't know the URL for a company, omit it from the array.
+Respond with the JSON array only — no explanation, no markdown fences."""
+
+    response = call_claude_with_retry(
+        client,
+        model="claude-opus-4-6",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = next((b.text for b in response.content if b.type == "text"), "[]")
+    result = extract_json(raw, array=True)
+    if not isinstance(result, list):
+        return []
+    resolved = [c for c in result if c.get("company_name") and c.get("company_url")]
+    for c in resolved:
+        print(f"    {c['company_name']} -> {c['company_url']}", file=sys.stderr)
+    return resolved
 
 
 def identify_tech_companies(
@@ -243,20 +284,21 @@ Page text (truncated):
 All links found on the page (up to 300):
 {json.dumps(links[:300], indent=2)}
 
-Task: Identify every company listed on this page.
+Task: Identify every portfolio company or investee company listed on this page.
 
 For each company, determine which kind of link is available:
 - TYPE A: a direct link to the company's own external website (e.g. https://stripe.com)
 - TYPE B: an internal link to a company-detail page on THIS same site (e.g. /companies/stripe or /rebels/ribbit)
+- TYPE C: company name found in the page text but no usable link of either type
 
 Return ONLY a JSON array. Each element must have:
   - "company_name": the company's name (string)
-  - "company_url": for TYPE A, the company's own website URL; for TYPE B, leave as ""
-  - "detail_url": for TYPE B, the full URL of the internal detail page; for TYPE A, leave as ""
+  - "company_url": for TYPE A, the company's own website URL; for TYPE B and C, leave as ""
+  - "detail_url": for TYPE B, the full URL of the internal detail page; for TYPE A and C, leave as ""
 
 Rules:
-- Do not include navigation links, blog posts, social media profiles, or news articles.
-- If a company has both types, prefer TYPE A.
+- Do not include navigation links, blog posts, social media profiles, news articles, or the VC firm itself.
+- If a company has both TYPE A and TYPE B, prefer TYPE A.
 - Skip duplicates.
 - If no companies are found, return [].
 
@@ -278,15 +320,21 @@ Respond with the JSON array only — no explanation, no markdown fences."""
     if not isinstance(result, list):
         return []
 
-    # Split into direct hits and detail pages that need follow-up
+    # Split into direct hits, detail pages needing follow-up, and name-only (TYPE C)
     direct = [c for c in result if c.get("company_url")]
     needs_detail = [c for c in result if not c.get("company_url") and c.get("detail_url")]
+    name_only = [c for c in result if not c.get("company_url") and not c.get("detail_url") and c.get("company_name")]
     if debug:
-        print(f"[DEBUG] Claude identified {len(direct)} direct URLs, {len(needs_detail)} detail pages", file=sys.stderr)
+        print(f"[DEBUG] Claude identified {len(direct)} direct URLs, {len(needs_detail)} detail pages, {len(name_only)} name-only", file=sys.stderr)
 
     if needs_detail:
         print(f"  Following {len(needs_detail)} company detail pages...", file=sys.stderr)
         resolved = _resolve_detail_pages(needs_detail, base_host, source_label, client)
+        direct.extend(resolved)
+
+    if name_only:
+        print(f"  Looking up URLs for {len(name_only)} name-only companies via Claude...", file=sys.stderr)
+        resolved = _resolve_name_only(name_only, client)
         direct.extend(resolved)
 
     # Normalise: drop detail_url key from output
@@ -327,7 +375,7 @@ def get_founder_info(
     """
     site_text = ""
     try:
-        html, _ = fetch_page(company_url)
+        html, _ = fetch_page(company_url, fast=True)
         soup = BeautifulSoup(html, "lxml")
         for tag in soup(["script", "style", "noscript"]):
             tag.decompose()
@@ -336,7 +384,7 @@ def get_founder_info(
         # Also try /about page
         about_url = company_url.rstrip("/") + "/about"
         try:
-            about_html, _ = fetch_page(about_url)
+            about_html, _ = fetch_page(about_url, fast=True)
             about_soup = BeautifulSoup(about_html, "lxml")
             for tag in about_soup(["script", "style", "noscript"]):
                 tag.decompose()
