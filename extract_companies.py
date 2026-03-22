@@ -284,7 +284,8 @@ Page text (truncated):
 All links found on the page (up to 300):
 {json.dumps(links[:300], indent=2)}
 
-Task: Identify every portfolio company or investee company listed on this page.
+Task: Identify every tech company or startup listed or mentioned on this page as a subject of interest
+(e.g. portfolio companies, investees, featured startups, ranked companies, profiled businesses, etc.).
 
 For each company, determine which kind of link is available:
 - TYPE A: a direct link to the company's own external website (e.g. https://stripe.com)
@@ -297,7 +298,7 @@ Return ONLY a JSON array. Each element must have:
   - "detail_url": for TYPE B, the full URL of the internal detail page; for TYPE A and C, leave as ""
 
 Rules:
-- Do not include navigation links, blog posts, social media profiles, news articles, or the VC firm itself.
+- Do not include the site/publication itself, nav links, author profiles, social media accounts, or unrelated ads.
 - If a company has both TYPE A and TYPE B, prefer TYPE A.
 - Skip duplicates.
 - If no companies are found, return [].
