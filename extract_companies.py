@@ -151,7 +151,18 @@ def page_text_and_links(html: str, base_url: str) -> tuple[str, list[dict]]:
 
 def extract_json(text: str, array: bool = True) -> list | dict | None:
     """Pull the first JSON array or object out of a Claude response."""
-    pattern = r"\[.*?\]" if array else r"\{.*?\}"
+    text = text.strip()
+    # Try direct parse first (Claude returned clean JSON)
+    try:
+        result = json.loads(text)
+        if array and isinstance(result, list):
+            return result
+        if not array and isinstance(result, dict):
+            return result
+    except json.JSONDecodeError:
+        pass
+    # Greedy match to capture the full outermost array/object
+    pattern = r"\[.*\]" if array else r"\{.*\}"
     match = re.search(pattern, text, re.DOTALL)
     if match:
         try:
@@ -270,12 +281,13 @@ Respond with the JSON array only — no explanation, no markdown fences."""
     response = call_claude_with_retry(
         client,
         model="claude-opus-4-6",
-        max_tokens=4096,
-        thinking={"type": "adaptive"},
+        max_tokens=8192,
         messages=[{"role": "user", "content": prompt}],
     )
 
     raw = next((b.text for b in response.content if b.type == "text"), "[]")
+    if not raw.strip() or raw.strip() == "[]":
+        print(f"  Warning: Claude returned empty response for {source_label}", file=sys.stderr)
     if debug:
         print(f"\n[DEBUG] Claude raw response:\n{raw[:2000]}\n", file=sys.stderr)
     result = extract_json(raw, array=True)
