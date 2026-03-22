@@ -59,16 +59,23 @@ def _fetch_with_playwright(url: str) -> str:
             viewport={"width": 1280, "height": 900},
         )
         page = context.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        page.goto(url, wait_until="networkidle", timeout=45000)
 
         # Scroll incrementally to trigger lazy-loading on portfolio pages
-        for _ in range(10):
+        for _ in range(20):
+            page.evaluate("window.scrollBy(0, window.innerHeight)")
+            page.wait_for_timeout(600)
+
+        # Second pass: scroll back to top then all the way down to catch any remaining lazy loads
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(500)
+        for _ in range(20):
             page.evaluate("window.scrollBy(0, window.innerHeight)")
             page.wait_for_timeout(400)
 
         # Final wait for any network activity triggered by scrolling
         try:
-            page.wait_for_load_state("networkidle", timeout=8000)
+            page.wait_for_load_state("networkidle", timeout=10000)
         except Exception:
             pass
 
@@ -89,8 +96,8 @@ def _looks_empty(html: str) -> bool:
 def fetch_page(source: str) -> tuple[str, str]:
     """Return (html_content, base_url) for a local file or URL.
 
-    For URLs, tries requests first; falls back to Playwright if the response
-    is blocked (4xx) or the page looks like an unrendered JS shell.
+    Local files are read directly. Web URLs always use Playwright so that
+    JS-rendered portfolio pages load fully before we extract links.
     """
     if os.path.exists(source):
         with open(source, "r", encoding="utf-8", errors="ignore") as f:
@@ -98,31 +105,8 @@ def fetch_page(source: str) -> tuple[str, str]:
         base_url = "file://" + os.path.abspath(source)
         return content, base_url
 
-    try:
-        resp = requests.get(
-            source,
-            timeout=15,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; CompanyExtractor/1.0)"},
-        )
-        resp.raise_for_status()
-        html = resp.text
-    except Exception:
-        html = ""
-
-    if not html or _looks_empty(html):
-        print("  Static fetch returned little content; retrying with Playwright...", file=sys.stderr)
-        html = _fetch_with_playwright(source)
-    else:
-        # Even if page text looks fine, JS may not have rendered links yet.
-        # Re-fetch with Playwright if almost no links were found.
-        from bs4 import BeautifulSoup as _BS
-        _soup = _BS(html, "lxml")
-        _link_count = len([a for a in _soup.find_all("a", href=True)
-                           if not a["href"].strip().startswith(("#", "mailto:", "tel:", "javascript:"))])
-        if _link_count <= 5:
-            print("  Static fetch found very few links; retrying with Playwright...", file=sys.stderr)
-            html = _fetch_with_playwright(source)
-
+    print("  Fetching with Playwright...", file=sys.stderr)
+    html = _fetch_with_playwright(source)
     return html, source
 
 
@@ -235,18 +219,18 @@ def identify_tech_companies(
 
     page_text, links = page_text_and_links(html, base_url)
 
+    print(f"  Page: {len(html)} chars HTML, {len(page_text)} chars text, {len(links)} links", file=sys.stderr)
+
     if debug:
-        print(f"\n[DEBUG] HTML length: {len(html)} chars", file=sys.stderr)
-        print(f"[DEBUG] Visible text length: {len(page_text)} chars", file=sys.stderr)
         print(f"[DEBUG] Text preview:\n{page_text[:500]}\n", file=sys.stderr)
-        print(f"[DEBUG] Links found: {len(links)}", file=sys.stderr)
+        print(f"[DEBUG] First 30 links:", file=sys.stderr)
         for lnk in links[:30]:
             print(f"  {lnk}", file=sys.stderr)
         if len(links) > 30:
             print(f"  ... and {len(links) - 30} more", file=sys.stderr)
 
     if not links:
-        print(f"  No links found in {source_label} even after Playwright; skipping.", file=sys.stderr)
+        print(f"  No links found in {source_label}; skipping.", file=sys.stderr)
         return []
 
     base_host = urlparse(base_url).netloc
