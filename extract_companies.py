@@ -485,6 +485,7 @@ def main():
     client = anthropic.Anthropic(api_key=api_key)
 
     all_companies: list[dict] = []
+    source_counts: list[tuple[str, int]] = []
 
     for source in args.sources:
         print(f"\nProcessing: {source}")
@@ -492,11 +493,13 @@ def main():
             html, base_url = fetch_page(source)
         except Exception as e:
             print(f"  Failed to load {source}: {e}", file=sys.stderr)
+            source_counts.append((source, 0))
             continue
 
         print("  Identifying tech companies via Claude...")
         companies = identify_tech_companies(html, base_url, source, client, debug=args.debug)
         print(f"  Found {len(companies)} tech companies.")
+        source_counts.append((source, len(companies)))
         for c in companies:
             c["source_url"] = clean_url(source)
         all_companies.extend(companies)
@@ -558,6 +561,10 @@ def main():
 
     print(f"\nDone. Results saved to: {args.output}")
     print(f"Columns: company_name, company_url, founder_first_name, founder_last_name, source_url")
+    print(f"\n--- Summary ---")
+    for source, count in source_counts:
+        print(f"  {source}: {count} companies found")
+    print(f"  Total unique: {len(all_companies)}")
 
 
 if __name__ == "__main__":
