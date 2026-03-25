@@ -358,6 +358,16 @@ def call_claude_with_retry(client: anthropic.Anthropic, max_retries: int = 4, **
             wait = rate_limit_delays[attempt]
             print(f"    Rate limit hit, waiting {wait}s before retry...", file=sys.stderr)
             time.sleep(wait)
+        except anthropic.APIStatusError as e:
+            if attempt == max_retries:
+                raise
+            if e.status_code == 529:
+                wait = rate_limit_delays[attempt]
+                print(f"    API overloaded (529), waiting {wait}s before retry...", file=sys.stderr)
+            else:
+                wait = delays[attempt]
+                print(f"    API error ({e.__class__.__name__}), retrying in {wait}s...", file=sys.stderr)
+            time.sleep(wait)
         except (anthropic.APITimeoutError, anthropic.APIConnectionError) as e:
             if attempt == max_retries:
                 raise
