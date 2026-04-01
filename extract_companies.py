@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Extract tech company links (and optionally founder names) from web pages.
+Extract tech company links (and optionally CEO names) from web pages.
 
 Usage:
     python extract_companies.py page1.html page2.html --output companies.csv
     python extract_companies.py https://example.com/portfolio --output companies.csv
-    python extract_companies.py page.html --no-founders --output companies.csv
+    python extract_companies.py page.html --no-ceo --output companies.csv
 
 Outputs a CSV with columns:
-    company_name, company_url, founder_first_name, founder_last_name, source_url
+    company_name, company_url, ceo_first_name, ceo_last_name, source_url
 
 Requires: ANTHROPIC_API_KEY environment variable
 """
@@ -376,37 +376,44 @@ def call_claude_with_retry(client: anthropic.Anthropic, max_retries: int = 4, **
             time.sleep(wait)
 
 
-def get_founder_info(
+_CEO_KEYWORDS = re.compile(r"\bCEO\b|Chief Executive|chief executive", re.IGNORECASE)
+
+
+def _extract_text(html: str, char_limit: int) -> str:
+    """Strip tags and return plain text, prioritizing paragraphs mentioning CEO."""
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    lines = soup.get_text(separator="\n", strip=True).splitlines()
+    # Pull lines mentioning CEO to the front so they survive the char limit
+    priority = [l for l in lines if _CEO_KEYWORDS.search(l)]
+    rest = [l for l in lines if not _CEO_KEYWORDS.search(l)]
+    combined = "\n".join(priority + rest)
+    return combined[:char_limit]
+
+
+def get_ceo_info(
     company_url: str, company_name: str, client: anthropic.Anthropic
 ) -> tuple[str, str]:
     """
-    Try to find founder info by:
-    1. Fetching the company's About/Team page.
-    2. Asking Claude to extract the founder name, falling back to its own knowledge.
+    Find the current CEO by:
+    1. Fetching the homepage plus /about, /team, /leadership, /people pages.
+    2. Asking Claude to extract the CEO name, falling back to its own knowledge.
     """
     site_text = ""
     try:
         html, _ = fetch_page(company_url, fast=True)
-        soup = BeautifulSoup(html, "lxml")
-        for tag in soup(["script", "style", "noscript"]):
-            tag.decompose()
-        site_text = soup.get_text(separator="\n", strip=True)[:5000]
+        site_text = _extract_text(html, 4000)
 
-        # Also try /about page
-        about_url = company_url.rstrip("/") + "/about"
-        try:
-            about_html, _ = fetch_page(about_url, fast=True)
-            about_soup = BeautifulSoup(about_html, "lxml")
-            for tag in about_soup(["script", "style", "noscript"]):
-                tag.decompose()
-            site_text += "\n" + about_soup.get_text(separator="\n", strip=True)[:3000]
-        except Exception:
-            pass
+        base = company_url.rstrip("/")
+        for path in ["/about", "/team", "/leadership", "/people"]:
+            try:
+                extra_html, _ = fetch_page(base + path, fast=True)
+                site_text += "\n" + _extract_text(extra_html, 2000)
+            except Exception:
+                pass
     except Exception as e:
-        print(
-            f"    Could not fetch {company_url}: {e}",
-            file=sys.stderr,
-        )
+        print(f"    Could not fetch {company_url}: {e}", file=sys.stderr)
 
     context_section = (
         f"Text scraped from the company's website:\n{site_text}\n\n"
@@ -414,13 +421,12 @@ def get_founder_info(
         else ""
     )
 
-    prompt = f"""I need the founder's name for the company "{company_name}" (website: {company_url}).
+    prompt = f"""I need the current CEO's name for the company "{company_name}" (website: {company_url}).
 
-{context_section}Using both the scraped text above (if any) AND your own knowledge, return the founder's name.
-If there are co-founders, return the primary/most well-known one.
+{context_section}Using both the scraped text above (if any) AND your own knowledge, return the current CEO's name.
 
 Return ONLY a JSON object with keys "first_name" and "last_name".
-If the founder is truly unknown, use empty strings.
+If the CEO is truly unknown, use empty strings.
 
 Example: {{"first_name": "Brian", "last_name": "Chesky"}}"""
 
@@ -462,7 +468,7 @@ def deduplicate(companies: list[dict]) -> list[dict]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract tech company links (and founders) from web pages."
+        description="Extract tech company links (and CEO names) from web pages."
     )
     parser.add_argument(
         "sources",
@@ -476,9 +482,9 @@ def main():
         help="Output CSV file path (default: companies.csv).",
     )
     parser.add_argument(
-        "--no-founders",
+        "--no-ceo",
         action="store_true",
-        help="Skip founder lookup (faster, columns will be empty).",
+        help="Skip CEO lookup (faster, columns will be empty).",
     )
     parser.add_argument(
         "--debug",
@@ -521,7 +527,7 @@ def main():
         print("No tech companies found. Exiting.")
         sys.exit(0)
 
-    fieldnames = ["company_name", "company_url", "founder_first_name", "founder_last_name", "source_url"]
+    fieldnames = ["company_name", "company_url", "ceo_first_name", "ceo_last_name", "source_url"]
 
     # Load checkpoint: any rows already written to the output CSV
     completed_urls: set[str] = set()
@@ -552,15 +558,15 @@ def main():
                 continue
 
             first, last = "", ""
-            if not args.no_founders and url:
-                print(f"  [{i}/{len(all_companies)}] Looking up founder for {name}...")
-                first, last = get_founder_info(url, name, client)
+            if not args.no_ceo and url:
+                print(f"  [{i}/{len(all_companies)}] Looking up CEO for {name}...")
+                first, last = get_ceo_info(url, name, client)
 
             row = {
                 "company_name": name,
                 "company_url": clean_url(url),
-                "founder_first_name": first,
-                "founder_last_name": last,
+                "ceo_first_name": first,
+                "ceo_last_name": last,
                 "source_url": company.get("source_url", ""),
             }
             writer.writerow(row)
@@ -570,7 +576,7 @@ def main():
         out_f.close()
 
     print(f"\nDone. Results saved to: {args.output}")
-    print(f"Columns: company_name, company_url, founder_first_name, founder_last_name, source_url")
+    print(f"Columns: company_name, company_url, ceo_first_name, ceo_last_name, source_url")
     print(f"\n--- Summary ---")
     for source, count in source_counts:
         print(f"  {source}: {count} companies found")
