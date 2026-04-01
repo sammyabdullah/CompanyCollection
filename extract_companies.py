@@ -379,6 +379,42 @@ def call_claude_with_retry(client: anthropic.Anthropic, max_retries: int = 4, **
 _CEO_KEYWORDS = re.compile(r"\bCEO\b|Chief Executive|chief executive", re.IGNORECASE)
 
 
+def _google_search_ceo(company_name: str, company_url: str) -> tuple[str, str]:
+    """
+    Search Google for '<company> CEO site:linkedin.com' and try to extract the
+    CEO name from the first result snippet.  Returns ("", "") on any failure.
+    """
+    query = f'"{company_name}" CEO site:linkedin.com'
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+    }
+    try:
+        resp = requests.get(
+            "https://www.google.com/search",
+            params={"q": query, "num": 5},
+            headers=headers,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+
+        # Collect text from result titles and snippets
+        snippets: list[str] = []
+        for tag in soup.select("h3"):
+            snippets.append(tag.get_text())
+        for tag in soup.select("div.VwiC3b, span.aCOpRe, div[data-sncf]"):
+            snippets.append(tag.get_text())
+
+        # Ask Claude to pull the CEO name out of the snippets
+        return snippets
+    except Exception:
+        return []
+
+
 def _extract_text(html: str, char_limit: int) -> str:
     """Strip tags and return plain text, prioritizing paragraphs mentioning CEO."""
     soup = BeautifulSoup(html, "lxml")
@@ -397,9 +433,18 @@ def get_ceo_info(
 ) -> tuple[str, str]:
     """
     Find the current CEO by:
-    1. Fetching the homepage plus /about, /team, /leadership, /people pages.
-    2. Asking Claude to extract the CEO name, falling back to its own knowledge.
+    1. Searching Google for '<company> CEO site:linkedin.com' and collecting snippets.
+    2. Fetching the homepage plus /about, /team, /leadership, /people pages.
+    3. Asking Claude to extract the CEO name from all collected text, falling back to its own knowledge.
     """
+    # Step 1: Google search snippets (LinkedIn results)
+    search_snippets = _google_search_ceo(company_name, company_url)
+    search_section = ""
+    if search_snippets:
+        joined = "\n".join(search_snippets[:20])
+        search_section = f"Google search snippets for '{company_name} CEO site:linkedin.com':\n{joined}\n\n"
+
+    # Step 2: Company website pages
     site_text = ""
     try:
         html, _ = fetch_page(company_url, fast=True)
@@ -415,7 +460,7 @@ def get_ceo_info(
     except Exception as e:
         print(f"    Could not fetch {company_url}: {e}", file=sys.stderr)
 
-    context_section = (
+    site_section = (
         f"Text scraped from the company's website:\n{site_text}\n\n"
         if site_text
         else ""
@@ -423,7 +468,8 @@ def get_ceo_info(
 
     prompt = f"""I need the current CEO's name for the company "{company_name}" (website: {company_url}).
 
-{context_section}Using both the scraped text above (if any) AND your own knowledge, return the current CEO's name.
+{search_section}{site_section}Using all sources above AND your own knowledge, return the current CEO's name.
+Prefer the most recent information — LinkedIn snippets are often more up to date than training data.
 
 Return ONLY a JSON object with keys "first_name" and "last_name".
 If the CEO is truly unknown, use empty strings.
