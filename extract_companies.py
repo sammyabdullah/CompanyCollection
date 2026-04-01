@@ -379,40 +379,78 @@ def call_claude_with_retry(client: anthropic.Anthropic, max_retries: int = 4, **
 _CEO_KEYWORDS = re.compile(r"\bCEO\b|Chief Executive|chief executive", re.IGNORECASE)
 
 
-def _google_search_ceo(company_name: str, company_url: str) -> tuple[str, str]:
+_SEARCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+
+
+def _snippets_from_soup(soup: BeautifulSoup, selectors: list[str]) -> list[str]:
+    snippets: list[str] = []
+    for tag in soup.select("h3"):
+        snippets.append(tag.get_text())
+    for selector in selectors:
+        for tag in soup.select(selector):
+            snippets.append(tag.get_text())
+    return [s.strip() for s in snippets if s.strip()]
+
+
+def _search_google(query: str) -> list[str]:
+    resp = requests.get(
+        "https://www.google.com/search",
+        params={"q": query, "num": 5},
+        headers=_SEARCH_HEADERS,
+        timeout=10,
+    )
+    resp.raise_for_status()
+    # Google returns a CAPTCHA page (no real results) when blocked
+    if "detected unusual traffic" in resp.text or len(resp.text) < 2000:
+        return []
+    soup = BeautifulSoup(resp.text, "lxml")
+    return _snippets_from_soup(soup, ["div.VwiC3b", "span.aCOpRe", "div[data-sncf]"])
+
+
+def _search_duckduckgo(query: str) -> list[str]:
+    resp = requests.get(
+        "https://html.duckduckgo.com/html/",
+        params={"q": query},
+        headers=_SEARCH_HEADERS,
+        timeout=10,
+    )
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "lxml")
+    return _snippets_from_soup(soup, ["a.result__snippet", ".result__snippet"])
+
+
+def _search_yahoo(query: str) -> list[str]:
+    resp = requests.get(
+        "https://search.yahoo.com/search",
+        params={"p": query, "n": 5},
+        headers=_SEARCH_HEADERS,
+        timeout=10,
+    )
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "lxml")
+    return _snippets_from_soup(soup, ["div.compText", "p.lh-16", "div.fc-falcon"])
+
+
+def _search_ceo_snippets(company_name: str) -> list[str]:
     """
-    Search Google for '<company> CEO site:linkedin.com' and try to extract the
-    CEO name from the first result snippet.  Returns ("", "") on any failure.
+    Try Google → DuckDuckGo → Yahoo in order, returning snippets from the
+    first engine that yields results.
     """
     query = f'"{company_name}" CEO site:linkedin.com'
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        )
-    }
-    try:
-        resp = requests.get(
-            "https://www.google.com/search",
-            params={"q": query, "num": 5},
-            headers=headers,
-            timeout=10,
-        )
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
-
-        # Collect text from result titles and snippets
-        snippets: list[str] = []
-        for tag in soup.select("h3"):
-            snippets.append(tag.get_text())
-        for tag in soup.select("div.VwiC3b, span.aCOpRe, div[data-sncf]"):
-            snippets.append(tag.get_text())
-
-        # Ask Claude to pull the CEO name out of the snippets
-        return snippets
-    except Exception:
-        return []
+    for fn, name in [(_search_google, "Google"), (_search_duckduckgo, "DuckDuckGo"), (_search_yahoo, "Yahoo")]:
+        try:
+            snippets = fn(query)
+            if snippets:
+                return snippets
+        except Exception:
+            pass
+    return []
 
 
 def _extract_text(html: str, char_limit: int) -> str:
@@ -437,8 +475,8 @@ def get_ceo_info(
     2. Fetching the homepage plus /about, /team, /leadership, /people pages.
     3. Asking Claude to extract the CEO name from all collected text, falling back to its own knowledge.
     """
-    # Step 1: Google search snippets (LinkedIn results)
-    search_snippets = _google_search_ceo(company_name, company_url)
+    # Step 1: Search engine snippets (LinkedIn results)
+    search_snippets = _search_ceo_snippets(company_name)
     search_section = ""
     if search_snippets:
         joined = "\n".join(search_snippets[:20])
