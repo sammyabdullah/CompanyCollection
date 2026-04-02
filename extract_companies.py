@@ -398,7 +398,38 @@ def _snippets_from_soup(soup: BeautifulSoup, selectors: list[str]) -> list[str]:
     return [s.strip() for s in snippets if s.strip()]
 
 
-def _search_google(query: str) -> list[str]:
+def _urls_from_soup_google(soup: BeautifulSoup) -> list[str]:
+    urls = []
+    for a in soup.select("a[href]"):
+        href = a["href"]
+        # Google wraps result URLs as /url?q=<actual_url>
+        if href.startswith("/url?q="):
+            actual = href[7:].split("&")[0]
+            if actual.startswith("http") and "google.com" not in actual:
+                urls.append(actual)
+    return urls
+
+
+def _urls_from_soup_duckduckgo(soup: BeautifulSoup) -> list[str]:
+    urls = []
+    for a in soup.select("a.result__url, a.result__a"):
+        href = a.get("href", "")
+        if href.startswith("http") and "duckduckgo.com" not in href:
+            urls.append(href)
+    return urls
+
+
+def _urls_from_soup_yahoo(soup: BeautifulSoup) -> list[str]:
+    urls = []
+    for a in soup.select("div.algo h3 a, h3.title a"):
+        href = a.get("href", "")
+        if href.startswith("http") and "yahoo.com" not in href:
+            urls.append(href)
+    return urls
+
+
+def _search_google(query: str) -> tuple[list[str], list[str]]:
+    """Returns (snippets, urls)."""
     resp = requests.get(
         "https://www.google.com/search",
         params={"q": query, "num": 5},
@@ -406,14 +437,17 @@ def _search_google(query: str) -> list[str]:
         timeout=10,
     )
     resp.raise_for_status()
-    # Google returns a CAPTCHA page (no real results) when blocked
     if "detected unusual traffic" in resp.text or len(resp.text) < 2000:
-        return []
+        return [], []
     soup = BeautifulSoup(resp.text, "lxml")
-    return _snippets_from_soup(soup, ["div.VwiC3b", "span.aCOpRe", "div[data-sncf]"])
+    return (
+        _snippets_from_soup(soup, ["div.VwiC3b", "span.aCOpRe", "div[data-sncf]"]),
+        _urls_from_soup_google(soup),
+    )
 
 
-def _search_duckduckgo(query: str) -> list[str]:
+def _search_duckduckgo(query: str) -> tuple[list[str], list[str]]:
+    """Returns (snippets, urls)."""
     resp = requests.get(
         "https://html.duckduckgo.com/html/",
         params={"q": query},
@@ -422,10 +456,14 @@ def _search_duckduckgo(query: str) -> list[str]:
     )
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "lxml")
-    return _snippets_from_soup(soup, ["a.result__snippet", ".result__snippet"])
+    return (
+        _snippets_from_soup(soup, ["a.result__snippet", ".result__snippet"]),
+        _urls_from_soup_duckduckgo(soup),
+    )
 
 
-def _search_yahoo(query: str) -> list[str]:
+def _search_yahoo(query: str) -> tuple[list[str], list[str]]:
+    """Returns (snippets, urls)."""
     resp = requests.get(
         "https://search.yahoo.com/search",
         params={"p": query, "n": 5},
@@ -434,15 +472,19 @@ def _search_yahoo(query: str) -> list[str]:
     )
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "lxml")
-    return _snippets_from_soup(soup, ["div.compText", "p.lh-16", "div.fc-falcon"])
+    return (
+        _snippets_from_soup(soup, ["div.compText", "p.lh-16", "div.fc-falcon"]),
+        _urls_from_soup_yahoo(soup),
+    )
 
 
-def _search_ceo_snippets(company_name: str, company_url: str) -> list[str]:
+def _search_ceo(company_name: str, company_url: str) -> tuple[list[str], list[str]]:
     """
     Run two queries in priority order:
       1. CEO site:<company domain>  — if this returns results, use them immediately.
       2. "<company name>" CEO site:linkedin.com  — only if query 1 found nothing.
     Each query tries Google → DuckDuckGo → Yahoo until one returns results.
+    Returns (snippets, urls).
     """
     domain = re.sub(r"^https?://(www\.)?", "", company_url).split("/")[0]
     queries = [
@@ -452,12 +494,12 @@ def _search_ceo_snippets(company_name: str, company_url: str) -> list[str]:
     for query in queries:
         for fn in [_search_google, _search_duckduckgo, _search_yahoo]:
             try:
-                snippets = fn(query)
-                if snippets:
-                    return snippets
+                snippets, urls = fn(query)
+                if snippets or urls:
+                    return snippets, urls
             except Exception:
                 pass
-    return []
+    return [], []
 
 
 def _extract_text(html: str, char_limit: int) -> str:
@@ -482,14 +524,26 @@ def get_ceo_info(
     2. Fetching the homepage plus /about, /team, /leadership, /people pages.
     3. Asking Claude to extract the CEO name from all collected text, falling back to its own knowledge.
     """
-    # Step 1: Search engine snippets (LinkedIn results)
-    search_snippets = _search_ceo_snippets(company_name, company_url)
-    search_section = ""
-    if search_snippets:
-        joined = "\n".join(search_snippets[:30])
-        search_section = f"Search engine snippets (CEO on company site + LinkedIn):\n{joined}\n\n"
+    # Step 1: Search for CEO — fetch the actual result pages, not just snippets
+    search_snippets, search_urls = _search_ceo(company_name, company_url)
+    search_text = ""
+    for url in search_urls[:3]:
+        try:
+            html, _ = fetch_page(url, fast=True)
+            search_text += "\n" + _extract_text(html, 3000)
+        except Exception:
+            pass
+    # Fall back to raw snippets if we couldn't load any pages
+    if not search_text and search_snippets:
+        search_text = "\n".join(search_snippets[:30])
 
-    # Step 2: Company website pages
+    search_section = (
+        f"Text from search result pages for '{company_name} CEO':\n{search_text}\n\n"
+        if search_text
+        else ""
+    )
+
+    # Step 2: Company website pages (guessed sub-paths)
     site_text = ""
     try:
         html, _ = fetch_page(company_url, fast=True)
@@ -514,7 +568,6 @@ def get_ceo_info(
     prompt = f"""I need the current CEO's name for the company "{company_name}" (website: {company_url}).
 
 {search_section}{site_section}Using all sources above AND your own knowledge, return the current CEO's name.
-Prefer the most recent information — LinkedIn snippets are often more up to date than training data.
 
 Return ONLY a JSON object with keys "first_name" and "last_name".
 If the CEO is truly unknown, use empty strings.
