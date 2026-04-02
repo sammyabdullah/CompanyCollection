@@ -410,23 +410,6 @@ def _urls_from_soup_google(soup: BeautifulSoup) -> list[str]:
     return urls
 
 
-def _urls_from_soup_duckduckgo(soup: BeautifulSoup) -> list[str]:
-    urls = []
-    for a in soup.select("a.result__url, a.result__a"):
-        href = a.get("href", "")
-        if href.startswith("http") and "duckduckgo.com" not in href:
-            urls.append(href)
-    return urls
-
-
-def _urls_from_soup_yahoo(soup: BeautifulSoup) -> list[str]:
-    urls = []
-    for a in soup.select("div.algo h3 a, h3.title a"):
-        href = a.get("href", "")
-        if href.startswith("http") and "yahoo.com" not in href:
-            urls.append(href)
-    return urls
-
 
 def _search_google(query: str) -> tuple[list[str], list[str]]:
     """Returns (snippets, urls)."""
@@ -446,44 +429,12 @@ def _search_google(query: str) -> tuple[list[str], list[str]]:
     )
 
 
-def _search_duckduckgo(query: str) -> tuple[list[str], list[str]]:
-    """Returns (snippets, urls)."""
-    resp = requests.get(
-        "https://html.duckduckgo.com/html/",
-        params={"q": query},
-        headers=_SEARCH_HEADERS,
-        timeout=10,
-    )
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "lxml")
-    return (
-        _snippets_from_soup(soup, ["a.result__snippet", ".result__snippet"]),
-        _urls_from_soup_duckduckgo(soup),
-    )
-
-
-def _search_yahoo(query: str) -> tuple[list[str], list[str]]:
-    """Returns (snippets, urls)."""
-    resp = requests.get(
-        "https://search.yahoo.com/search",
-        params={"p": query, "n": 5},
-        headers=_SEARCH_HEADERS,
-        timeout=10,
-    )
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "lxml")
-    return (
-        _snippets_from_soup(soup, ["div.compText", "p.lh-16", "div.fc-falcon"]),
-        _urls_from_soup_yahoo(soup),
-    )
-
 
 def _search_ceo(company_name: str, company_url: str) -> tuple[list[str], list[str]]:
     """
     Run two queries in priority order:
       1. CEO site:<company domain>  — if this returns results, use them immediately.
       2. "<company name>" CEO site:linkedin.com  — only if query 1 found nothing.
-    Each query tries Google → DuckDuckGo → Yahoo until one returns results.
     Returns (snippets, urls).
     """
     domain = re.sub(r"^https?://(www\.)?", "", company_url).split("/")[0]
@@ -492,13 +443,12 @@ def _search_ceo(company_name: str, company_url: str) -> tuple[list[str], list[st
         f'"{company_name}" CEO site:linkedin.com',
     ]
     for query in queries:
-        for fn in [_search_google, _search_duckduckgo, _search_yahoo]:
-            try:
-                snippets, urls = fn(query)
-                if snippets or urls:
-                    return snippets, urls
-            except Exception:
-                pass
+        try:
+            snippets, urls = _search_google(query)
+            if snippets or urls:
+                return snippets, urls
+        except Exception:
+            pass
     return [], []
 
 
@@ -550,7 +500,7 @@ def get_ceo_info(
         site_text = _extract_text(html, 4000)
 
         base = company_url.rstrip("/")
-        for path in ["/about", "/team", "/leadership", "/people"]:
+        for path in ["/about", "/team"]:
             try:
                 extra_html, _ = fetch_page(base + path, fast=True)
                 site_text += "\n" + _extract_text(extra_html, 2000)
