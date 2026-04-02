@@ -437,20 +437,29 @@ def _search_yahoo(query: str) -> list[str]:
     return _snippets_from_soup(soup, ["div.compText", "p.lh-16", "div.fc-falcon"])
 
 
-def _search_ceo_snippets(company_name: str) -> list[str]:
+def _search_ceo_snippets(company_name: str, company_url: str) -> list[str]:
     """
-    Try Google → DuckDuckGo → Yahoo in order, returning snippets from the
-    first engine that yields results.
+    Run two queries and collect snippets from all three search engines:
+      1. CEO site:<company domain>  (most targeted — finds CEO on their own site)
+      2. "<company name>" CEO site:linkedin.com  (LinkedIn profile fallback)
+    Each query tries Google → DuckDuckGo → Yahoo until one returns results.
     """
-    query = f'"{company_name}" CEO site:linkedin.com'
-    for fn, name in [(_search_google, "Google"), (_search_duckduckgo, "DuckDuckGo"), (_search_yahoo, "Yahoo")]:
-        try:
-            snippets = fn(query)
-            if snippets:
-                return snippets
-        except Exception:
-            pass
-    return []
+    domain = re.sub(r"^https?://(www\.)?", "", company_url).split("/")[0]
+    queries = [
+        f"CEO site:{domain}",
+        f'"{company_name}" CEO site:linkedin.com',
+    ]
+    all_snippets: list[str] = []
+    for query in queries:
+        for fn in [_search_google, _search_duckduckgo, _search_yahoo]:
+            try:
+                snippets = fn(query)
+                if snippets:
+                    all_snippets.extend(snippets)
+                    break
+            except Exception:
+                pass
+    return all_snippets
 
 
 def _extract_text(html: str, char_limit: int) -> str:
@@ -476,11 +485,11 @@ def get_ceo_info(
     3. Asking Claude to extract the CEO name from all collected text, falling back to its own knowledge.
     """
     # Step 1: Search engine snippets (LinkedIn results)
-    search_snippets = _search_ceo_snippets(company_name)
+    search_snippets = _search_ceo_snippets(company_name, company_url)
     search_section = ""
     if search_snippets:
-        joined = "\n".join(search_snippets[:20])
-        search_section = f"Google search snippets for '{company_name} CEO site:linkedin.com':\n{joined}\n\n"
+        joined = "\n".join(search_snippets[:30])
+        search_section = f"Search engine snippets (CEO on company site + LinkedIn):\n{joined}\n\n"
 
     # Step 2: Company website pages
     site_text = ""
