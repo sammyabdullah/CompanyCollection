@@ -439,9 +439,9 @@ def _search_yahoo(query: str) -> list[str]:
 
 def _search_ceo_snippets(company_name: str, company_url: str) -> list[str]:
     """
-    Run two queries and collect snippets from all three search engines:
-      1. CEO site:<company domain>  (most targeted — finds CEO on their own site)
-      2. "<company name>" CEO site:linkedin.com  (LinkedIn profile fallback)
+    Run two queries in priority order:
+      1. CEO site:<company domain>  — if this returns results, use them immediately.
+      2. "<company name>" CEO site:linkedin.com  — only if query 1 found nothing.
     Each query tries Google → DuckDuckGo → Yahoo until one returns results.
     """
     domain = re.sub(r"^https?://(www\.)?", "", company_url).split("/")[0]
@@ -449,17 +449,15 @@ def _search_ceo_snippets(company_name: str, company_url: str) -> list[str]:
         f"CEO site:{domain}",
         f'"{company_name}" CEO site:linkedin.com',
     ]
-    all_snippets: list[str] = []
     for query in queries:
         for fn in [_search_google, _search_duckduckgo, _search_yahoo]:
             try:
                 snippets = fn(query)
                 if snippets:
-                    all_snippets.extend(snippets)
-                    break
+                    return snippets
             except Exception:
                 pass
-    return all_snippets
+    return []
 
 
 def _extract_text(html: str, char_limit: int) -> str:
