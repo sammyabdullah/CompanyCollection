@@ -498,14 +498,6 @@ def get_ceo_info(
     try:
         html, _ = fetch_page(company_url, fast=True)
         site_text = _extract_text(html, 4000)
-
-        base = company_url.rstrip("/")
-        for path in ["/about", "/team"]:
-            try:
-                extra_html, _ = fetch_page(base + path, fast=True)
-                site_text += "\n" + _extract_text(extra_html, 2000)
-            except Exception:
-                pass
     except Exception as e:
         print(f"    Could not fetch {company_url}: {e}", file=sys.stderr)
 
