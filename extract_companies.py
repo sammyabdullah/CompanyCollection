@@ -23,7 +23,6 @@ import time
 from urllib.parse import urljoin
 
 import anthropic
-import requests
 from bs4 import BeautifulSoup
 
 
@@ -376,50 +375,18 @@ def call_claude_with_retry(client: anthropic.Anthropic, max_retries: int = 4, **
             time.sleep(wait)
 
 
-_SEARCH_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-}
-
-
-def _google_ceo_snippets(domain: str) -> list[str]:
+def _google_ceo_snippets(domain: str) -> str:
     """
-    Search Google for '<domain> CEO' and return all text snippets from the SERP,
-    including knowledge panel, Gemini/AI overview, and regular result descriptions.
+    Search Google for '<domain> CEO' using Playwright and return the full
+    page text so Claude can find the CEO name regardless of Google's
+    obfuscated class names.
     """
-    resp = requests.get(
-        "https://www.google.com/search",
-        params={"q": f"{domain} CEO", "num": 5},
-        headers=_SEARCH_HEADERS,
-        timeout=10,
-    )
-    resp.raise_for_status()
-    if "detected unusual traffic" in resp.text or len(resp.text) < 2000:
-        return []
-    soup = BeautifulSoup(resp.text, "lxml")
-    snippets: list[str] = []
-    # Cast a wide net: headings, result descriptions, knowledge panel, AI overview
-    for selector in [
-        "h3",
-        "div.VwiC3b",
-        "span.aCOpRe",
-        "div[data-sncf]",
-        "div.kno-rdesc",   # knowledge panel description
-        "span.LrzXr",      # knowledge panel fact value
-        "div.Z0LcW",       # featured snippet / direct answer
-        "div.IZ6rdc",      # another direct-answer container
-        "div.zCubwf",      # AI overview / Gemini summary text
-        "div.wDYxhc",      # AI overview block
-        "div[data-attrid]",  # structured knowledge attributes (e.g. "CEO")
-    ]:
-        for tag in soup.select(selector):
-            text = tag.get_text(separator=" ", strip=True)
-            if text:
-                snippets.append(text)
-    return snippets
+    url = f"https://www.google.com/search?q={domain}+CEO&num=5"
+    html = _fetch_with_playwright(url, fast=True)
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    return soup.get_text(separator="\n", strip=True)
 
 
 def get_ceo_info(
@@ -433,19 +400,17 @@ def get_ceo_info(
     domain = re.sub(r"^https?://(www\.)?", "", company_url).split("/")[0]
 
     try:
-        snippets = _google_ceo_snippets(domain)
+        page_text = _google_ceo_snippets(domain)
     except Exception as e:
         print(f"    Google search failed for {domain}: {e}", file=sys.stderr)
-        snippets = []
-
-    if not snippets:
         return "", ""
 
-    text = "\n".join(snippets[:40])
+    if not page_text.strip():
+        return "", ""
 
-    prompt = f"""These are snippets from a Google search results page for the query "{domain} CEO".
+    prompt = f"""This is the text from a Google search results page for the query "{domain} CEO".
 
-{text[:3000]}
+{page_text[:4000]}
 
 Find the first person's name mentioned as CEO or Chief Executive Officer.
 Return ONLY a JSON object: {{"first_name": "...", "last_name": "..."}}
