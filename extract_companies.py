@@ -376,9 +376,6 @@ def call_claude_with_retry(client: anthropic.Anthropic, max_retries: int = 4, **
             time.sleep(wait)
 
 
-_CEO_KEYWORDS = re.compile(r"\bCEO\b|Chief Executive|chief executive", re.IGNORECASE)
-
-
 _SEARCH_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -388,138 +385,76 @@ _SEARCH_HEADERS = {
 }
 
 
-def _snippets_from_soup(soup: BeautifulSoup, selectors: list[str]) -> list[str]:
-    snippets: list[str] = []
-    for tag in soup.select("h3"):
-        snippets.append(tag.get_text())
-    for selector in selectors:
-        for tag in soup.select(selector):
-            snippets.append(tag.get_text())
-    return [s.strip() for s in snippets if s.strip()]
-
-
-def _urls_from_soup_google(soup: BeautifulSoup) -> list[str]:
-    urls = []
-    for a in soup.select("a[href]"):
-        href = a["href"]
-        # Google wraps result URLs as /url?q=<actual_url>
-        if href.startswith("/url?q="):
-            actual = href[7:].split("&")[0]
-            if actual.startswith("http") and "google.com" not in actual:
-                urls.append(actual)
-    return urls
-
-
-
-def _search_google(query: str) -> tuple[list[str], list[str]]:
-    """Returns (snippets, urls)."""
+def _google_ceo_snippets(domain: str) -> list[str]:
+    """
+    Search Google for '<domain> CEO' and return all text snippets from the SERP,
+    including knowledge panel, Gemini/AI overview, and regular result descriptions.
+    """
     resp = requests.get(
         "https://www.google.com/search",
-        params={"q": query, "num": 5},
+        params={"q": f"{domain} CEO", "num": 5},
         headers=_SEARCH_HEADERS,
         timeout=10,
     )
     resp.raise_for_status()
     if "detected unusual traffic" in resp.text or len(resp.text) < 2000:
-        return [], []
+        return []
     soup = BeautifulSoup(resp.text, "lxml")
-    return (
-        _snippets_from_soup(soup, ["div.VwiC3b", "span.aCOpRe", "div[data-sncf]"]),
-        _urls_from_soup_google(soup),
-    )
-
-
-
-def _search_ceo(company_name: str, company_url: str) -> tuple[list[str], list[str]]:
-    """
-    Run two queries in priority order:
-      1. CEO site:<company domain>  — if this returns results, use them immediately.
-      2. "<company name>" CEO site:linkedin.com  — only if query 1 found nothing.
-    Returns (snippets, urls).
-    """
-    domain = re.sub(r"^https?://(www\.)?", "", company_url).split("/")[0]
-    queries = [
-        f"CEO site:{domain}",
-        f'"{company_name}" CEO site:linkedin.com',
-    ]
-    for query in queries:
-        try:
-            snippets, urls = _search_google(query)
-            if snippets or urls:
-                return snippets, urls
-        except Exception:
-            pass
-    return [], []
-
-
-def _extract_text(html: str, char_limit: int) -> str:
-    """Strip tags and return plain text, prioritizing paragraphs mentioning CEO."""
-    soup = BeautifulSoup(html, "lxml")
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    lines = soup.get_text(separator="\n", strip=True).splitlines()
-    # Pull lines mentioning CEO to the front so they survive the char limit
-    priority = [l for l in lines if _CEO_KEYWORDS.search(l)]
-    rest = [l for l in lines if not _CEO_KEYWORDS.search(l)]
-    combined = "\n".join(priority + rest)
-    return combined[:char_limit]
+    snippets: list[str] = []
+    # Cast a wide net: headings, result descriptions, knowledge panel, AI overview
+    for selector in [
+        "h3",
+        "div.VwiC3b",
+        "span.aCOpRe",
+        "div[data-sncf]",
+        "div.kno-rdesc",   # knowledge panel description
+        "span.LrzXr",      # knowledge panel fact value
+        "div.Z0LcW",       # featured snippet / direct answer
+        "div.IZ6rdc",      # another direct-answer container
+        "div.zCubwf",      # AI overview / Gemini summary text
+        "div.wDYxhc",      # AI overview block
+        "div[data-attrid]",  # structured knowledge attributes (e.g. "CEO")
+    ]:
+        for tag in soup.select(selector):
+            text = tag.get_text(separator=" ", strip=True)
+            if text:
+                snippets.append(text)
+    return snippets
 
 
 def get_ceo_info(
     company_url: str, company_name: str, client: anthropic.Anthropic
 ) -> tuple[str, str]:
     """
-    Find the current CEO by:
-    1. Searching Google for '<company> CEO site:linkedin.com' and collecting snippets.
-    2. Fetching the homepage plus /about, /team, /leadership, /people pages.
-    3. Asking Claude to extract the CEO name from all collected text, falling back to its own knowledge.
+    Find the current CEO by Googling '<domain> CEO' and extracting
+    the first name that appears alongside CEO / Chief Executive Officer
+    in the Google SERP (including Gemini/AI overview and knowledge panel).
     """
-    # Step 1: Search for CEO — fetch the actual result pages, not just snippets
-    search_snippets, search_urls = _search_ceo(company_name, company_url)
-    search_text = ""
-    for url in search_urls[:3]:
-        try:
-            html, _ = fetch_page(url, fast=True)
-            search_text += "\n" + _extract_text(html, 3000)
-        except Exception:
-            pass
-    # Fall back to raw snippets if we couldn't load any pages
-    if not search_text and search_snippets:
-        search_text = "\n".join(search_snippets[:30])
+    domain = re.sub(r"^https?://(www\.)?", "", company_url).split("/")[0]
 
-    search_section = (
-        f"Text from search result pages for '{company_name} CEO':\n{search_text}\n\n"
-        if search_text
-        else ""
-    )
-
-    # Step 2: Company website pages (guessed sub-paths)
-    site_text = ""
     try:
-        html, _ = fetch_page(company_url, fast=True)
-        site_text = _extract_text(html, 4000)
+        snippets = _google_ceo_snippets(domain)
     except Exception as e:
-        print(f"    Could not fetch {company_url}: {e}", file=sys.stderr)
+        print(f"    Google search failed for {domain}: {e}", file=sys.stderr)
+        snippets = []
 
-    site_section = (
-        f"Text scraped from the company's website:\n{site_text}\n\n"
-        if site_text
-        else ""
-    )
+    if not snippets:
+        return "", ""
 
-    prompt = f"""I need the current CEO's name for the company "{company_name}" (website: {company_url}).
+    text = "\n".join(snippets[:40])
 
-{search_section}{site_section}Using all sources above AND your own knowledge, return the current CEO's name.
+    prompt = f"""These are snippets from a Google search results page for the query "{domain} CEO".
 
-Return ONLY a JSON object with keys "first_name" and "last_name".
-If the CEO is truly unknown, use empty strings.
+{text[:3000]}
 
-Example: {{"first_name": "Brian", "last_name": "Chesky"}}"""
+Find the first person's name mentioned as CEO or Chief Executive Officer.
+Return ONLY a JSON object: {{"first_name": "...", "last_name": "..."}}
+If no CEO name is visible, return {{"first_name": "", "last_name": ""}}"""
 
     response = call_claude_with_retry(
         client,
         model="claude-opus-4-6",
-        max_tokens=256,
+        max_tokens=128,
         messages=[{"role": "user", "content": prompt}],
     )
 
