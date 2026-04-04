@@ -381,69 +381,63 @@ _GOOGLE_BLOCKED_SIGNALS = [
     "captcha",
     "are you a robot",
     "verify you're a human",
-    "enable javascript",
     "access denied",
 ]
 
+_COMPANY_SUBPAGES = ["/about", "/team", "/leadership", "/people", "/about-us", "/our-team", "/company"]
 
-def _google_ceo_snippets(domain: str) -> str:
-    """
-    Search Google for '<domain> CEO' using Playwright.
-    Returns full page text, or empty string if Google blocks the request.
-    """
-    url = f"https://www.google.com/search?q={domain}+CEO&num=5"
+
+def _fetch_text(url: str) -> str:
+    """Fetch a URL with Playwright and return plain text."""
     html = _fetch_with_playwright(url, fast=True)
     soup = BeautifulSoup(html, "lxml")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
-    text = soup.get_text(separator="\n", strip=True)
+    return soup.get_text(separator="\n", strip=True)
+
+
+def _is_blocked(text: str) -> bool:
     lower = text.lower()
-    if any(signal in lower for signal in _GOOGLE_BLOCKED_SIGNALS):
-        print(f"    Google blocked/CAPTCHA for {domain}, skipping.", file=sys.stderr)
-        return ""
-    return text
+    return any(signal in lower for signal in _GOOGLE_BLOCKED_SIGNALS)
 
 
-def get_ceo_info(
-    company_url: str, company_name: str, client: anthropic.Anthropic
-) -> tuple[str, str]:
+def _google_result_urls(domain: str) -> list[str]:
     """
-    Find the current CEO by Googling '<domain> CEO' and extracting
-    the first name that appears alongside CEO / Chief Executive Officer
-    in the Google SERP (including Gemini/AI overview and knowledge panel).
+    Search Google for '<domain> CEO', return up to 3 non-Google organic result URLs.
+    Returns [] if blocked.
     """
-    domain = re.sub(r"^https?://(www\.)?", "", company_url).split("/")[0]
+    search_html = _fetch_with_playwright(
+        f"https://www.google.com/search?q={domain}+CEO&num=5", fast=True
+    )
+    soup = BeautifulSoup(search_html, "lxml")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    if _is_blocked(soup.get_text()):
+        print(f"    Google blocked for {domain}", file=sys.stderr)
+        return []
 
-    # Small delay to reduce Google rate-limiting across 640 companies
-    time.sleep(2)
+    urls, seen = [], set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if href.startswith("/url?q="):
+            actual = href[7:].split("&")[0]
+            if actual.startswith("http") and "google.com" not in actual and actual not in seen:
+                seen.add(actual)
+                urls.append(actual)
+                if len(urls) >= 3:
+                    break
+    return urls
 
-    page_text = ""
-    # Retry up to 3 times if blocked, with increasing back-off
-    for attempt, wait in enumerate([0, 15, 45]):
-        if wait:
-            print(f"    Waiting {wait}s before retrying Google search for {domain}...", file=sys.stderr)
-            time.sleep(wait)
-        try:
-            page_text = _google_ceo_snippets(domain)
-        except Exception as e:
-            print(f"    Google search error for {domain}: {e}", file=sys.stderr)
-            continue
-        if page_text:
-            break
 
-    if not page_text:
-        print(f"    No Google results for {domain} (blocked or empty).", file=sys.stderr)
-        return "", ""
+def _extract_ceo(text: str, domain: str, client: anthropic.Anthropic) -> tuple[str, str]:
+    """Ask Claude to find the CEO name in text. Returns ('', '') if not found."""
+    prompt = f"""Text from a webpage about {domain}.
 
-    print(f"    Got {len(page_text)} chars from Google for {domain}", file=sys.stderr)
+{text[:4000]}
 
-    prompt = f"""This is the text from a Google search results page for the query "{domain} CEO".
-
-{page_text[:4000]}
-
-Find the first person's name mentioned as CEO or Chief Executive Officer.
-Return ONLY a JSON object: {{"first_name": "...", "last_name": "..."}}
-If no CEO name is visible, return {{"first_name": "", "last_name": ""}}"""
+Find the current CEO or Chief Executive Officer name.
+Return ONLY: {{"first_name": "...", "last_name": "..."}}
+If not found, return {{"first_name": "", "last_name": ""}}"""
 
     response = call_claude_with_retry(
         client,
@@ -451,18 +445,75 @@ If no CEO name is visible, return {{"first_name": "", "last_name": ""}}"""
         max_tokens=128,
         messages=[{"role": "user", "content": prompt}],
     )
-
     raw = next((b.text for b in response.content if b.type == "text"), "{}")
     data = extract_json(raw, array=False)
     if isinstance(data, dict):
-        first = data.get("first_name", "")
-        last = data.get("last_name", "")
-        if first or last:
-            print(f"    CEO found: {first} {last}", file=sys.stderr)
-        else:
-            print(f"    No CEO name found in Google results for {domain}", file=sys.stderr)
-        return first, last
+        return data.get("first_name", ""), data.get("last_name", "")
     return "", ""
+
+
+def get_ceo_info(
+    company_url: str, company_name: str, client: anthropic.Anthropic
+) -> tuple[str, str]:
+    """
+    Find the CEO using this workflow:
+    1. Google '<domain> CEO' → open the first non-sponsored result
+    2. If not found, try the company website's About/Team/Leadership pages
+    3. If still not found, search LinkedIn for '<domain> CEO'
+    """
+    domain = re.sub(r"^https?://(www\.)?", "", company_url).split("/")[0]
+    time.sleep(2)  # pace requests to avoid Google rate-limiting
+
+    # ── Step 1: Google → first search result page ──────────────────────────
+    try:
+        result_urls = _google_result_urls(domain)
+    except Exception as e:
+        print(f"    Google search error for {domain}: {e}", file=sys.stderr)
+        result_urls = []
+
+    for url in result_urls[:1]:
+        try:
+            print(f"    Checking search result: {url}", file=sys.stderr)
+            text = _fetch_text(url)
+            first, last = _extract_ceo(text, domain, client)
+            if first or last:
+                print(f"    CEO found on result page: {first} {last}", file=sys.stderr)
+                return first, last
+        except Exception as e:
+            print(f"    Could not fetch result page {url}: {e}", file=sys.stderr)
+
+    # ── Step 2: Company website About/Team pages ────────────────────────────
+    print(f"    Trying company website for {domain}...", file=sys.stderr)
+    base = company_url.rstrip("/")
+    for path in _COMPANY_SUBPAGES:
+        try:
+            text = _fetch_text(base + path)
+            first, last = _extract_ceo(text, domain, client)
+            if first or last:
+                print(f"    CEO found on {path}: {first} {last}", file=sys.stderr)
+                return first, last
+        except Exception:
+            continue
+
+    # ── Step 3: LinkedIn search ─────────────────────────────────────────────
+    print(f"    Trying LinkedIn for {domain}...", file=sys.stderr)
+    try:
+        linkedin_urls = _google_result_urls(f"site:linkedin.com/in {domain} CEO")
+        for url in linkedin_urls[:2]:
+            try:
+                text = _fetch_text(url)
+                first, last = _extract_ceo(text, domain, client)
+                if first or last:
+                    print(f"    CEO found on LinkedIn: {first} {last}", file=sys.stderr)
+                    return first, last
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"    LinkedIn search error for {domain}: {e}", file=sys.stderr)
+
+    print(f"    No CEO found for {domain}", file=sys.stderr)
+    return "", ""
+
 
 
 def clean_url(url: str) -> str:
