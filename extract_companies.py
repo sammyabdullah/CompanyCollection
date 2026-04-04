@@ -375,18 +375,33 @@ def call_claude_with_retry(client: anthropic.Anthropic, max_retries: int = 4, **
             time.sleep(wait)
 
 
+_GOOGLE_BLOCKED_SIGNALS = [
+    "unusual traffic",
+    "detected unusual",
+    "captcha",
+    "are you a robot",
+    "verify you're a human",
+    "enable javascript",
+    "access denied",
+]
+
+
 def _google_ceo_snippets(domain: str) -> str:
     """
-    Search Google for '<domain> CEO' using Playwright and return the full
-    page text so Claude can find the CEO name regardless of Google's
-    obfuscated class names.
+    Search Google for '<domain> CEO' using Playwright.
+    Returns full page text, or empty string if Google blocks the request.
     """
     url = f"https://www.google.com/search?q={domain}+CEO&num=5"
     html = _fetch_with_playwright(url, fast=True)
     soup = BeautifulSoup(html, "lxml")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
-    return soup.get_text(separator="\n", strip=True)
+    text = soup.get_text(separator="\n", strip=True)
+    lower = text.lower()
+    if any(signal in lower for signal in _GOOGLE_BLOCKED_SIGNALS):
+        print(f"    Google blocked/CAPTCHA for {domain}, skipping.", file=sys.stderr)
+        return ""
+    return text
 
 
 def get_ceo_info(
@@ -399,14 +414,28 @@ def get_ceo_info(
     """
     domain = re.sub(r"^https?://(www\.)?", "", company_url).split("/")[0]
 
-    try:
-        page_text = _google_ceo_snippets(domain)
-    except Exception as e:
-        print(f"    Google search failed for {domain}: {e}", file=sys.stderr)
+    # Small delay to reduce Google rate-limiting across 640 companies
+    time.sleep(2)
+
+    page_text = ""
+    # Retry up to 3 times if blocked, with increasing back-off
+    for attempt, wait in enumerate([0, 15, 45]):
+        if wait:
+            print(f"    Waiting {wait}s before retrying Google search for {domain}...", file=sys.stderr)
+            time.sleep(wait)
+        try:
+            page_text = _google_ceo_snippets(domain)
+        except Exception as e:
+            print(f"    Google search error for {domain}: {e}", file=sys.stderr)
+            continue
+        if page_text:
+            break
+
+    if not page_text:
+        print(f"    No Google results for {domain} (blocked or empty).", file=sys.stderr)
         return "", ""
 
-    if not page_text.strip():
-        return "", ""
+    print(f"    Got {len(page_text)} chars from Google for {domain}", file=sys.stderr)
 
     prompt = f"""This is the text from a Google search results page for the query "{domain} CEO".
 
@@ -426,7 +455,13 @@ If no CEO name is visible, return {{"first_name": "", "last_name": ""}}"""
     raw = next((b.text for b in response.content if b.type == "text"), "{}")
     data = extract_json(raw, array=False)
     if isinstance(data, dict):
-        return data.get("first_name", ""), data.get("last_name", "")
+        first = data.get("first_name", "")
+        last = data.get("last_name", "")
+        if first or last:
+            print(f"    CEO found: {first} {last}", file=sys.stderr)
+        else:
+            print(f"    No CEO name found in Google results for {domain}", file=sys.stderr)
+        return first, last
     return "", ""
 
 
