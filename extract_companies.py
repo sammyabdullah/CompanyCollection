@@ -384,8 +384,6 @@ _GOOGLE_BLOCKED_SIGNALS = [
     "access denied",
 ]
 
-_COMPANY_SUBPAGES = ["/about", "/team", "/leadership", "/people", "/about-us", "/our-team", "/company"]
-
 _ABOUT_LINK_PATTERN = re.compile(
     r"\b(about|team|leadership|people|founders?|executives?|management|staff|who we are)\b",
     re.IGNORECASE,
@@ -455,12 +453,6 @@ def _find_about_links(company_url: str) -> list[str]:
             if full not in seen and full != company_url:
                 seen.add(full)
                 found.append(full)
-
-    # Also append guessed paths that weren't already found
-    for path in _COMPANY_SUBPAGES:
-        guessed = base + path
-        if guessed not in seen:
-            found.append(guessed)
 
     return found[:8]  # cap to avoid excessive fetches
 
@@ -533,12 +525,10 @@ def get_ceo_info(
         except Exception:
             continue
 
-    # ── Step 3: Crunchbase / Wikipedia / news via Google ───────────────────
-    print(f"    [Step 3] Trying Crunchbase/Wikipedia for {domain}...", file=sys.stderr)
+    # ── Step 3: Crunchbase via Google ──────────────────────────────────────
+    print(f"    [Step 3] Trying Crunchbase for {domain}...", file=sys.stderr)
     fallback_queries = [
         f'"{company_name}" CEO site:crunchbase.com',
-        f'"{company_name}" CEO site:wikipedia.org',
-        f'"{company_name}" CEO',
     ]
     for query in fallback_queries:
         try:
