@@ -386,6 +386,11 @@ _GOOGLE_BLOCKED_SIGNALS = [
 
 _COMPANY_SUBPAGES = ["/about", "/team", "/leadership", "/people", "/about-us", "/our-team", "/company"]
 
+_ABOUT_LINK_PATTERN = re.compile(
+    r"\b(about|team|leadership|people|founders?|executives?|management|staff|who we are)\b",
+    re.IGNORECASE,
+)
+
 
 def _fetch_text(url: str) -> str:
     """Fetch a URL with Playwright and return plain text."""
@@ -401,19 +406,16 @@ def _is_blocked(text: str) -> bool:
     return any(signal in lower for signal in _GOOGLE_BLOCKED_SIGNALS)
 
 
-def _google_result_urls(domain: str) -> list[str]:
-    """
-    Search Google for '<domain> CEO', return up to 3 non-Google organic result URLs.
-    Returns [] if blocked.
-    """
+def _google_result_urls(query: str, max_results: int = 3) -> list[str]:
+    """Search Google, return up to max_results non-Google organic result URLs."""
     search_html = _fetch_with_playwright(
-        f"https://www.google.com/search?q={domain}+CEO&num=5", fast=True
+        f"https://www.google.com/search?q={query}&num=5", fast=True
     )
     soup = BeautifulSoup(search_html, "lxml")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
     if _is_blocked(soup.get_text()):
-        print(f"    Google blocked for {domain}", file=sys.stderr)
+        print(f"    Google blocked for query: {query[:60]}", file=sys.stderr)
         return []
 
     urls, seen = [], set()
@@ -424,16 +426,50 @@ def _google_result_urls(domain: str) -> list[str]:
             if actual.startswith("http") and "google.com" not in actual and actual not in seen:
                 seen.add(actual)
                 urls.append(actual)
-                if len(urls) >= 3:
+                if len(urls) >= max_results:
                     break
     return urls
+
+
+def _find_about_links(company_url: str) -> list[str]:
+    """
+    Fetch the company homepage and extract links that look like About/Team pages.
+    Falls back to guessed subpaths if none are found.
+    """
+    try:
+        html = _fetch_with_playwright(company_url, fast=True)
+    except Exception:
+        return [company_url.rstrip("/") + p for p in _COMPANY_SUBPAGES]
+
+    soup = BeautifulSoup(html, "lxml")
+    base = company_url.rstrip("/")
+    found, seen = [], set()
+
+    for a in soup.find_all("a", href=True):
+        text = a.get_text(strip=True)
+        href = a["href"].strip()
+        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+            continue
+        if _ABOUT_LINK_PATTERN.search(text) or _ABOUT_LINK_PATTERN.search(href):
+            full = urljoin(company_url, href)
+            if full not in seen and full != company_url:
+                seen.add(full)
+                found.append(full)
+
+    # Also append guessed paths that weren't already found
+    for path in _COMPANY_SUBPAGES:
+        guessed = base + path
+        if guessed not in seen:
+            found.append(guessed)
+
+    return found[:8]  # cap to avoid excessive fetches
 
 
 def _extract_ceo(text: str, domain: str, client: anthropic.Anthropic) -> tuple[str, str]:
     """Ask Claude to find the CEO name in text. Returns ('', '') if not found."""
     prompt = f"""Below is text scraped from a single webpage. Read it carefully.
 
-{text[:4000]}
+{text[:5000]}
 
 Does this text explicitly name a CEO or Chief Executive Officer?
 - If YES: return their name exactly as written on the page.
@@ -458,63 +494,70 @@ def get_ceo_info(
     company_url: str, company_name: str, client: anthropic.Anthropic
 ) -> tuple[str, str]:
     """
-    Find the CEO using this workflow:
-    1. Google '<domain> CEO' → open the first non-sponsored result
-    2. If not found, try the company website's About/Team/Leadership pages
-    3. If still not found, search LinkedIn for '<domain> CEO'
+    Find the CEO:
+    1. Google '<domain> CEO' → try first 3 organic results
+    2. Company website: crawl homepage for About/Team links, follow them
+    3. Google '<company name> CEO' on Crunchbase, Wikipedia, or news
     """
     domain = re.sub(r"^https?://(www\.)?", "", company_url).split("/")[0]
-    time.sleep(2)  # pace requests to avoid Google rate-limiting
+    time.sleep(2)
 
-    # ── Step 1: Google → first search result page ──────────────────────────
+    # ── Step 1: Google → first 3 search result pages ───────────────────────
     try:
-        result_urls = _google_result_urls(domain)
+        result_urls = _google_result_urls(f"{domain} CEO", max_results=3)
     except Exception as e:
         print(f"    Google search error for {domain}: {e}", file=sys.stderr)
         result_urls = []
 
-    for url in result_urls[:1]:
+    for url in result_urls:
         try:
-            print(f"    Checking search result: {url}", file=sys.stderr)
+            print(f"    [Step 1] Checking: {url}", file=sys.stderr)
             text = _fetch_text(url)
             first, last = _extract_ceo(text, domain, client)
             if first or last:
-                print(f"    CEO found on result page: {first} {last}", file=sys.stderr)
+                print(f"    CEO found (Step 1): {first} {last}", file=sys.stderr)
                 return first, last
         except Exception as e:
-            print(f"    Could not fetch result page {url}: {e}", file=sys.stderr)
+            print(f"    Could not fetch {url}: {e}", file=sys.stderr)
 
     # ── Step 2: Company website About/Team pages ────────────────────────────
-    print(f"    Trying company website for {domain}...", file=sys.stderr)
-    base = company_url.rstrip("/")
-    for path in _COMPANY_SUBPAGES:
+    print(f"    [Step 2] Crawling company website for {domain}...", file=sys.stderr)
+    about_urls = _find_about_links(company_url)
+    for url in about_urls:
         try:
-            text = _fetch_text(base + path)
+            text = _fetch_text(url)
             first, last = _extract_ceo(text, domain, client)
             if first or last:
-                print(f"    CEO found on {path}: {first} {last}", file=sys.stderr)
+                print(f"    CEO found (Step 2) at {url}: {first} {last}", file=sys.stderr)
                 return first, last
         except Exception:
             continue
 
-    # ── Step 3: LinkedIn search ─────────────────────────────────────────────
-    print(f"    Trying LinkedIn for {domain}...", file=sys.stderr)
-    try:
-        linkedin_urls = _google_result_urls(f"site:linkedin.com/in {domain} CEO")
-        for url in linkedin_urls[:2]:
-            try:
-                text = _fetch_text(url)
-                first, last = _extract_ceo(text, domain, client)
-                if first or last:
-                    print(f"    CEO found on LinkedIn: {first} {last}", file=sys.stderr)
-                    return first, last
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"    LinkedIn search error for {domain}: {e}", file=sys.stderr)
+    # ── Step 3: Crunchbase / Wikipedia / news via Google ───────────────────
+    print(f"    [Step 3] Trying Crunchbase/Wikipedia for {domain}...", file=sys.stderr)
+    fallback_queries = [
+        f'"{company_name}" CEO site:crunchbase.com',
+        f'"{company_name}" CEO site:wikipedia.org',
+        f'"{company_name}" CEO',
+    ]
+    for query in fallback_queries:
+        try:
+            urls = _google_result_urls(query, max_results=2)
+            for url in urls:
+                try:
+                    text = _fetch_text(url)
+                    first, last = _extract_ceo(text, domain, client)
+                    if first or last:
+                        print(f"    CEO found (Step 3) at {url}: {first} {last}", file=sys.stderr)
+                        return first, last
+                except Exception:
+                    continue
+        except Exception:
+            continue
 
     print(f"    No CEO found for {domain}", file=sys.stderr)
     return "", ""
+
 
 
 
