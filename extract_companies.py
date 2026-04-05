@@ -432,12 +432,12 @@ def _google_result_urls(query: str, max_results: int = 3) -> list[str]:
 def _find_about_links(company_url: str) -> list[str]:
     """
     Fetch the company homepage and extract links that look like About/Team pages.
-    Falls back to guessed subpaths if none are found.
+    Returns empty list if the homepage can't be loaded.
     """
     try:
         html = _fetch_with_playwright(company_url, fast=True)
     except Exception:
-        return [company_url.rstrip("/") + p for p in _COMPANY_SUBPAGES]
+        return []
 
     soup = BeautifulSoup(html, "lxml")
     base = company_url.rstrip("/")
