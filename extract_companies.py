@@ -431,13 +431,15 @@ def _google_result_urls(domain: str) -> list[str]:
 
 def _extract_ceo(text: str, domain: str, client: anthropic.Anthropic) -> tuple[str, str]:
     """Ask Claude to find the CEO name in text. Returns ('', '') if not found."""
-    prompt = f"""Text from a webpage about {domain}.
+    prompt = f"""Below is text scraped from a single webpage. Read it carefully.
 
 {text[:4000]}
 
-Find the current CEO or Chief Executive Officer name.
-Return ONLY: {{"first_name": "...", "last_name": "..."}}
-If not found, return {{"first_name": "", "last_name": ""}}"""
+Does this text explicitly name a CEO or Chief Executive Officer?
+- If YES: return their name exactly as written on the page.
+- If NO: return empty strings. Do NOT guess, infer, or use outside knowledge.
+
+Return ONLY: {{"first_name": "...", "last_name": "..."}}"""
 
     response = call_claude_with_retry(
         client,
