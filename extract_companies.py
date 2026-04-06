@@ -400,6 +400,32 @@ def _html_to_text(html: str) -> str:
     return soup.get_text(separator="\n", strip=True)
 
 
+def _extract_ceo(text: str, domain: str, client: anthropic.Anthropic) -> tuple[str, str]:
+    """Ask Claude to find the CEO name in text. Returns ('', '') if not found."""
+    prompt = f"""Below is text scraped from a single webpage. Read it carefully.
+
+{text[:5000]}
+
+Does this text explicitly name a CEO or Chief Executive Officer?
+- If YES: return their name exactly as written on the page.
+- If NO: return empty strings. Do NOT guess, infer, or use outside knowledge.
+
+Return ONLY: {{"first_name": "...", "last_name": "..."}}"""
+
+    response = call_claude_with_retry(
+        client,
+        model="claude-opus-4-6",
+        max_tokens=128,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = next((b.text for b in response.content if b.type == "text"), "{}")
+    data = extract_json(raw, array=False)
+    if isinstance(data, dict):
+        return data.get("first_name", ""), data.get("last_name", "")
+    return "", ""
+    return soup.get_text(separator="\n", strip=True)
+
+
 def get_ceo_info(
     company_url: str, company_name: str, client: anthropic.Anthropic
 ) -> tuple[str, str]:
