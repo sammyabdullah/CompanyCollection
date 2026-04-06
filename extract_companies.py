@@ -506,7 +506,27 @@ def get_ceo_info(
     return "", ""
 
 
-def clean_url(url: str) -> str:
+def _domain_matches_company(company_name: str, domain: str) -> bool:
+    """
+    Return False if the domain appears completely unrelated to the company name
+    (e.g. acquired companies whose URL now points to the acquirer).
+    Strips common suffixes (Health, Inc, AI, etc.) before comparing.
+    """
+    stopwords = {
+        "health", "inc", "llc", "ai", "io", "co", "com", "app", "get",
+        "the", "and", "labs", "lab", "technologies", "technology", "solutions",
+        "software", "systems", "group", "services", "digital", "global",
+        "medical", "care", "bio", "net", "org",
+    }
+    name_words = set(re.findall(r"[a-z]+", company_name.lower())) - stopwords
+    domain_clean = re.sub(r"\.[a-z]{2,}$", "", domain.lower())  # strip TLD
+    domain_words = set(re.findall(r"[a-z]+", domain_clean)) - stopwords
+
+    if not name_words:
+        return True  # can't determine, assume OK
+    return bool(name_words & domain_words) or any(w in domain_clean for w in name_words)
+
+
     """Strip protocol/www and return only the domain (stop at first '/')."""
     url = re.sub(r"^https?://", "", url)
     url = re.sub(r"^www\.", "", url)
@@ -589,7 +609,7 @@ def main():
         print("No tech companies found. Exiting.")
         sys.exit(0)
 
-    fieldnames = ["company_name", "company_url", "ceo_first_name", "ceo_last_name", "source_url"]
+    fieldnames = ["company_name", "company_url", "ceo_first_name", "ceo_last_name", "source_url", "notes"]
 
     # Load checkpoint: any rows already written to the output CSV
     completed_urls: set[str] = set()
@@ -620,16 +640,27 @@ def main():
                 continue
 
             first, last = "", ""
-            if not args.no_ceo and url:
+            notes = ""
+            domain = clean_url(url)
+
+            # Flag domain mismatch (acquired/redirected companies)
+            if url and not _domain_matches_company(name, domain):
+                notes = "domain_mismatch"
+                print(f"  [{i}/{len(all_companies)}] Skipping CEO lookup for {name} "
+                      f"(domain mismatch: {domain})", file=sys.stderr)
+            elif not args.no_ceo and url:
                 print(f"  [{i}/{len(all_companies)}] Looking up CEO for {name}...")
                 first, last = get_ceo_info(url, name, client)
+                if first and not last:
+                    notes = "first_name_only"
 
             row = {
                 "company_name": name,
-                "company_url": clean_url(url),
+                "company_url": domain,
                 "ceo_first_name": first,
                 "ceo_last_name": last,
                 "source_url": company.get("source_url", ""),
+                "notes": notes,
             }
             writer.writerow(row)
             out_f.flush()
@@ -638,7 +669,9 @@ def main():
         out_f.close()
 
     print(f"\nDone. Results saved to: {args.output}")
-    print(f"Columns: company_name, company_url, ceo_first_name, ceo_last_name, source_url")
+    print(f"Columns: company_name, company_url, ceo_first_name, ceo_last_name, source_url, notes")
+    print(f"  notes values: 'domain_mismatch' = URL points to acquirer/wrong site, "
+          f"'first_name_only' = CEO first name found but no last name")
     print(f"\n--- Summary ---")
     for source, count in source_counts:
         print(f"  {source}: {count} companies found")
