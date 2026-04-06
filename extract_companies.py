@@ -20,9 +20,10 @@ import os
 import re
 import sys
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, unquote
 
 import anthropic
+import requests
 from bs4 import BeautifulSoup
 
 
@@ -404,44 +405,63 @@ def _is_blocked(text: str) -> bool:
     return any(signal in lower for signal in _GOOGLE_BLOCKED_SIGNALS)
 
 
-def _google_result_urls(query: str, max_results: int = 3) -> list[str]:
-    """Search Google, return up to max_results non-Google organic result URLs."""
-    search_html = _fetch_with_playwright(
-        f"https://www.google.com/search?q={query}&num=5", fast=True
-    )
-    soup = BeautifulSoup(search_html, "lxml")
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    page_text = soup.get_text()
-    if _is_blocked(page_text):
-        print(f"    Google blocked for query: {query[:60]}", file=sys.stderr)
+_DDG_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def _ddg_result_urls(query: str, max_results: int = 3) -> list[str]:
+    """
+    Search DuckDuckGo HTML endpoint (no JS, no bot blocking) and return
+    up to max_results organic result URLs.
+    """
+    try:
+        resp = requests.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            headers=_DDG_HEADERS,
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"    DDG search failed for '{query[:60]}': {e}", file=sys.stderr)
         return []
 
-    _SKIP_DOMAINS = {"google.com", "google.", "youtube.com", "accounts.google"}
-
+    soup = BeautifulSoup(resp.text, "lxml")
     urls, seen = [], set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-
-        # Playwright-rendered Google: links are direct URLs
-        if href.startswith("http") and not any(d in href for d in _SKIP_DOMAINS):
-            candidate = href.split("&")[0]
-        # Static/cached Google HTML: links wrapped as /url?q=<actual>
-        elif href.startswith("/url?q="):
-            candidate = href[7:].split("&")[0]
-            if not candidate.startswith("http") or any(d in candidate for d in _SKIP_DOMAINS):
-                continue
+    for a in soup.select("a.result__a"):
+        href = a.get("href", "")
+        # DDG wraps URLs: //duckduckgo.com/l/?uddg=<encoded_url>&...
+        if "uddg=" in href:
+            actual = unquote(href.split("uddg=")[1].split("&")[0])
+        elif href.startswith("http"):
+            actual = href
         else:
             continue
-
-        if candidate not in seen:
-            seen.add(candidate)
-            urls.append(candidate)
+        if actual.startswith("http") and "duckduckgo.com" not in actual and actual not in seen:
+            seen.add(actual)
+            urls.append(actual)
             if len(urls) >= max_results:
                 break
 
-    print(f"    Google returned {len(urls)} URLs for: {query[:60]}", file=sys.stderr)
+    print(f"    DDG returned {len(urls)} URLs for: {query[:60]}", file=sys.stderr)
     return urls
+
+
+def _crunchbase_urls(company_name: str, domain: str) -> list[str]:
+    """
+    Build candidate Crunchbase organization page URLs directly from
+    the company name and domain — no search engine needed.
+    """
+    name_slug = re.sub(r"[^a-z0-9]+", "-", company_name.lower()).strip("-")
+    domain_slug = domain.split(".")[0]
+    slugs = list(dict.fromkeys([name_slug, domain_slug]))  # deduped, name first
+    return [f"https://www.crunchbase.com/organization/{s}" for s in slugs]
 
 
 _FALLBACK_SUBPAGES = ["/about", "/team", "/leadership", "/people", "/about-us"]
@@ -520,12 +540,8 @@ def get_ceo_info(
     domain = re.sub(r"^https?://(www\.)?", "", company_url).split("/")[0]
     time.sleep(2)
 
-    # ── Step 1: Google → first 3 search result pages ───────────────────────
-    try:
-        result_urls = _google_result_urls(f"{domain} CEO", max_results=3)
-    except Exception as e:
-        print(f"    Google search error for {domain}: {e}", file=sys.stderr)
-        result_urls = []
+    # ── Step 1: DuckDuckGo → first 3 search result pages ──────────────────
+    result_urls = _ddg_result_urls(f"{domain} CEO", max_results=3)
 
     for url in result_urls:
         try:
@@ -551,23 +567,15 @@ def get_ceo_info(
         except Exception:
             continue
 
-    # ── Step 3: Crunchbase via Google ──────────────────────────────────────
+    # ── Step 3: Crunchbase (direct URL, no search engine) ──────────────────
     print(f"    [Step 3] Trying Crunchbase for {domain}...", file=sys.stderr)
-    fallback_queries = [
-        f'"{company_name}" CEO site:crunchbase.com',
-    ]
-    for query in fallback_queries:
+    for url in _crunchbase_urls(company_name, domain):
         try:
-            urls = _google_result_urls(query, max_results=2)
-            for url in urls:
-                try:
-                    text = _fetch_text(url)
-                    first, last = _extract_ceo(text, domain, client)
-                    if first or last:
-                        print(f"    CEO found (Step 3) at {url}: {first} {last}", file=sys.stderr)
-                        return first, last
-                except Exception:
-                    continue
+            text = _fetch_text(url)
+            first, last = _extract_ceo(text, domain, client)
+            if first or last:
+                print(f"    CEO found (Step 3) at {url}: {first} {last}", file=sys.stderr)
+                return first, last
         except Exception:
             continue
 
