@@ -20,10 +20,9 @@ import os
 import re
 import sys
 import time
-from urllib.parse import urljoin, unquote
+from urllib.parse import urljoin
 
 import anthropic
-import requests
 from bs4 import BeautifulSoup
 
 
@@ -376,15 +375,6 @@ def call_claude_with_retry(client: anthropic.Anthropic, max_retries: int = 4, **
             time.sleep(wait)
 
 
-_GOOGLE_BLOCKED_SIGNALS = [
-    "unusual traffic",
-    "detected unusual",
-    "captcha",
-    "are you a robot",
-    "verify you're a human",
-    "access denied",
-]
-
 _ABOUT_LINK_PATTERN = re.compile(
     r"\b(about|team|leadership|people|founders?|executives?|management|staff|who we are)\b",
     re.IGNORECASE,
@@ -400,200 +390,84 @@ def _fetch_text(url: str) -> str:
     return soup.get_text(separator="\n", strip=True)
 
 
-def _is_blocked(text: str) -> bool:
-    lower = text.lower()
-    return any(signal in lower for signal in _GOOGLE_BLOCKED_SIGNALS)
 
 
-_DDG_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
+_SUBPAGES_TO_TRY = [
+    "/about", "/team", "/leadership", "/people", "/about-us",
+    "/our-team", "/company", "/who-we-are", "/about/team",
+    "/about/leadership", "/company/team", "/company/about",
+    "/en/about", "/en/team",
+]
 
 
-def _ddg_result_urls(query: str, max_results: int = 3) -> list[str]:
+def _find_pages_to_check(company_url: str) -> list[str]:
     """
-    Search DuckDuckGo HTML endpoint and return up to max_results organic result URLs.
-    Uses POST (required by html.duckduckgo.com/html/) with fallback to lite endpoint.
-    """
-    def _parse_ddg_html(html: str) -> list[str]:
-        soup = BeautifulSoup(html, "lxml")
-        urls, seen = [], set()
-        # html endpoint: <a class="result__a">, lite endpoint: <a class="result-link">
-        for a in soup.select("a.result__a, a.result-link"):
-            href = a.get("href", "")
-            if "uddg=" in href:
-                actual = unquote(href.split("uddg=")[1].split("&")[0])
-            elif href.startswith("http"):
-                actual = href
-            else:
-                continue
-            if actual.startswith("http") and "duckduckgo.com" not in actual and actual not in seen:
-                seen.add(actual)
-                urls.append(actual)
-                if len(urls) >= max_results:
-                    break
-        return urls
-
-    # Primary: POST to html endpoint
-    try:
-        resp = requests.post(
-            "https://html.duckduckgo.com/html/",
-            data={"q": query},
-            headers=_DDG_HEADERS,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        urls = _parse_ddg_html(resp.text)
-        if urls:
-            print(f"    DDG returned {len(urls)} URLs for: {query[:60]}", file=sys.stderr)
-            return urls
-    except Exception as e:
-        print(f"    DDG html failed for '{query[:60]}': {e}", file=sys.stderr)
-
-    # Fallback: GET to lite endpoint
-    try:
-        resp = requests.get(
-            "https://lite.duckduckgo.com/lite/",
-            params={"q": query},
-            headers=_DDG_HEADERS,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        urls = _parse_ddg_html(resp.text)
-        print(f"    DDG lite returned {len(urls)} URLs for: {query[:60]}", file=sys.stderr)
-        return urls
-    except Exception as e:
-        print(f"    DDG lite failed for '{query[:60]}': {e}", file=sys.stderr)
-        return []
-
-
-
-
-_FALLBACK_SUBPAGES = ["/about", "/team", "/leadership", "/people", "/about-us"]
-
-
-def _find_about_links(company_url: str) -> list[str]:
-    """
-    Fetch the company homepage and extract links that look like About/Team pages.
-    Falls back to common subpaths if the homepage can't be loaded or no links found.
+    Fetch the homepage and collect every URL worth checking for CEO info:
+    1. The homepage itself
+    2. Any About/Team links found in the nav/body
+    3. All common subpath guesses (always included, not just as fallback)
+    Returns a deduped ordered list.
     """
     base = company_url.rstrip("/")
-    fallback = [base + p for p in _FALLBACK_SUBPAGES]
+    seen = set()
+    pages = []
 
+    def _add(url: str):
+        if url not in seen:
+            seen.add(url)
+            pages.append(url)
+
+    # Always check the homepage itself first
+    _add(company_url)
+
+    # Crawl homepage for nav/body About/Team links
     try:
-        # Use fast=False so JS-rendered nav menus have time to appear
         html = _fetch_with_playwright(company_url, fast=False)
+        soup = BeautifulSoup(html, "lxml")
+        for a in soup.find_all("a", href=True):
+            text = a.get_text(strip=True)
+            href = a["href"].strip()
+            if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+                continue
+            if _ABOUT_LINK_PATTERN.search(text) or _ABOUT_LINK_PATTERN.search(href):
+                full = urljoin(company_url, href)
+                if full.startswith(base):  # stay on same domain
+                    _add(full)
     except Exception:
-        return fallback
+        pass
 
-    soup = BeautifulSoup(html, "lxml")
-    found, seen = [], set()
+    # Always append common subpaths — they often exist even without nav links
+    for path in _SUBPAGES_TO_TRY:
+        _add(base + path)
 
-    for a in soup.find_all("a", href=True):
-        text = a.get_text(strip=True)
-        href = a["href"].strip()
-        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
-            continue
-        if _ABOUT_LINK_PATTERN.search(text) or _ABOUT_LINK_PATTERN.search(href):
-            full = urljoin(company_url, href)
-            if full not in seen and full != company_url:
-                seen.add(full)
-                found.append(full)
-
-    if not found:
-        print(f"    No About/Team links found on homepage, trying fallback paths", file=sys.stderr)
-        return fallback
-
-    print(f"    Found {len(found)} About/Team links on homepage", file=sys.stderr)
-    return found[:8]
-
-
-def _extract_ceo(text: str, domain: str, client: anthropic.Anthropic) -> tuple[str, str]:
-    """Ask Claude to find the CEO name in text. Returns ('', '') if not found."""
-    prompt = f"""Below is text scraped from a single webpage. Read it carefully.
-
-{text[:5000]}
-
-Does this text explicitly name a CEO or Chief Executive Officer?
-- If YES: return their name exactly as written on the page.
-- If NO: return empty strings. Do NOT guess, infer, or use outside knowledge.
-
-Return ONLY: {{"first_name": "...", "last_name": "..."}}"""
-
-    response = call_claude_with_retry(
-        client,
-        model="claude-opus-4-6",
-        max_tokens=128,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = next((b.text for b in response.content if b.type == "text"), "{}")
-    data = extract_json(raw, array=False)
-    if isinstance(data, dict):
-        return data.get("first_name", ""), data.get("last_name", "")
-    return "", ""
+    return pages
 
 
 def get_ceo_info(
     company_url: str, company_name: str, client: anthropic.Anthropic
 ) -> tuple[str, str]:
     """
-    Find the CEO:
-    1. Google '<domain> CEO' → try first 3 organic results
-    2. Company website: crawl homepage for About/Team links, follow them
-    3. Google '<company name> CEO' on Crunchbase, Wikipedia, or news
+    Find the CEO by crawling the company's own website:
+    checks the homepage, any About/Team links found in the nav,
+    and a broad set of common subpaths.
     """
     domain = re.sub(r"^https?://(www\.)?", "", company_url).split("/")[0]
-    time.sleep(2)
 
-    # ── Step 1: DuckDuckGo → first 3 search result pages ──────────────────
-    result_urls = _ddg_result_urls(f"{domain} CEO", max_results=3)
+    pages = _find_pages_to_check(company_url)
+    print(f"    Checking {len(pages)} pages on {domain}...", file=sys.stderr)
 
-    for url in result_urls:
-        try:
-            print(f"    [Step 1] Checking: {url}", file=sys.stderr)
-            text = _fetch_text(url)
-            first, last = _extract_ceo(text, domain, client)
-            if first or last:
-                print(f"    CEO found (Step 1): {first} {last}", file=sys.stderr)
-                return first, last
-        except Exception as e:
-            print(f"    Could not fetch {url}: {e}", file=sys.stderr)
-
-    # ── Step 2: Company website About/Team pages ────────────────────────────
-    print(f"    [Step 2] Crawling company website for {domain}...", file=sys.stderr)
-    about_urls = _find_about_links(company_url)
-    for url in about_urls:
+    for url in pages:
         try:
             text = _fetch_text(url)
             first, last = _extract_ceo(text, domain, client)
             if first or last:
-                print(f"    CEO found (Step 2) at {url}: {first} {last}", file=sys.stderr)
-                return first, last
-        except Exception:
-            continue
-
-    # ── Step 3: DuckDuckGo search for company name + CEO ──────────────────
-    print(f"    [Step 3] DDG search for '{company_name} CEO'...", file=sys.stderr)
-    step3_urls = _ddg_result_urls(f'"{company_name}" CEO', max_results=3)
-    for url in step3_urls:
-        try:
-            text = _fetch_text(url)
-            first, last = _extract_ceo(text, domain, client)
-            if first or last:
-                print(f"    CEO found (Step 3) at {url}: {first} {last}", file=sys.stderr)
+                print(f"    CEO found at {url}: {first} {last}", file=sys.stderr)
                 return first, last
         except Exception:
             continue
 
     print(f"    No CEO found for {domain}", file=sys.stderr)
     return "", ""
-
-
 
 
 def clean_url(url: str) -> str:
