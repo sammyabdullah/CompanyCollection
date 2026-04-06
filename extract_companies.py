@@ -412,35 +412,56 @@ def _google_result_urls(query: str, max_results: int = 3) -> list[str]:
     soup = BeautifulSoup(search_html, "lxml")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
-    if _is_blocked(soup.get_text()):
+    page_text = soup.get_text()
+    if _is_blocked(page_text):
         print(f"    Google blocked for query: {query[:60]}", file=sys.stderr)
         return []
+
+    _SKIP_DOMAINS = {"google.com", "google.", "youtube.com", "accounts.google"}
 
     urls, seen = [], set()
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if href.startswith("/url?q="):
-            actual = href[7:].split("&")[0]
-            if actual.startswith("http") and "google.com" not in actual and actual not in seen:
-                seen.add(actual)
-                urls.append(actual)
-                if len(urls) >= max_results:
-                    break
+
+        # Playwright-rendered Google: links are direct URLs
+        if href.startswith("http") and not any(d in href for d in _SKIP_DOMAINS):
+            candidate = href.split("&")[0]
+        # Static/cached Google HTML: links wrapped as /url?q=<actual>
+        elif href.startswith("/url?q="):
+            candidate = href[7:].split("&")[0]
+            if not candidate.startswith("http") or any(d in candidate for d in _SKIP_DOMAINS):
+                continue
+        else:
+            continue
+
+        if candidate not in seen:
+            seen.add(candidate)
+            urls.append(candidate)
+            if len(urls) >= max_results:
+                break
+
+    print(f"    Google returned {len(urls)} URLs for: {query[:60]}", file=sys.stderr)
     return urls
+
+
+_FALLBACK_SUBPAGES = ["/about", "/team", "/leadership", "/people", "/about-us"]
 
 
 def _find_about_links(company_url: str) -> list[str]:
     """
     Fetch the company homepage and extract links that look like About/Team pages.
-    Returns empty list if the homepage can't be loaded.
+    Falls back to common subpaths if the homepage can't be loaded or no links found.
     """
+    base = company_url.rstrip("/")
+    fallback = [base + p for p in _FALLBACK_SUBPAGES]
+
     try:
-        html = _fetch_with_playwright(company_url, fast=True)
+        # Use fast=False so JS-rendered nav menus have time to appear
+        html = _fetch_with_playwright(company_url, fast=False)
     except Exception:
-        return []
+        return fallback
 
     soup = BeautifulSoup(html, "lxml")
-    base = company_url.rstrip("/")
     found, seen = [], set()
 
     for a in soup.find_all("a", href=True):
@@ -454,7 +475,12 @@ def _find_about_links(company_url: str) -> list[str]:
                 seen.add(full)
                 found.append(full)
 
-    return found[:8]  # cap to avoid excessive fetches
+    if not found:
+        print(f"    No About/Team links found on homepage, trying fallback paths", file=sys.stderr)
+        return fallback
+
+    print(f"    Found {len(found)} About/Team links on homepage", file=sys.stderr)
+    return found[:8]
 
 
 def _extract_ceo(text: str, domain: str, client: anthropic.Anthropic) -> tuple[str, str]:
