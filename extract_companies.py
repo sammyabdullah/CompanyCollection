@@ -417,51 +417,61 @@ _DDG_HEADERS = {
 
 def _ddg_result_urls(query: str, max_results: int = 3) -> list[str]:
     """
-    Search DuckDuckGo HTML endpoint (no JS, no bot blocking) and return
-    up to max_results organic result URLs.
+    Search DuckDuckGo HTML endpoint and return up to max_results organic result URLs.
+    Uses POST (required by html.duckduckgo.com/html/) with fallback to lite endpoint.
     """
+    def _parse_ddg_html(html: str) -> list[str]:
+        soup = BeautifulSoup(html, "lxml")
+        urls, seen = [], set()
+        # html endpoint: <a class="result__a">, lite endpoint: <a class="result-link">
+        for a in soup.select("a.result__a, a.result-link"):
+            href = a.get("href", "")
+            if "uddg=" in href:
+                actual = unquote(href.split("uddg=")[1].split("&")[0])
+            elif href.startswith("http"):
+                actual = href
+            else:
+                continue
+            if actual.startswith("http") and "duckduckgo.com" not in actual and actual not in seen:
+                seen.add(actual)
+                urls.append(actual)
+                if len(urls) >= max_results:
+                    break
+        return urls
+
+    # Primary: POST to html endpoint
+    try:
+        resp = requests.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query},
+            headers=_DDG_HEADERS,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        urls = _parse_ddg_html(resp.text)
+        if urls:
+            print(f"    DDG returned {len(urls)} URLs for: {query[:60]}", file=sys.stderr)
+            return urls
+    except Exception as e:
+        print(f"    DDG html failed for '{query[:60]}': {e}", file=sys.stderr)
+
+    # Fallback: GET to lite endpoint
     try:
         resp = requests.get(
-            "https://html.duckduckgo.com/html/",
+            "https://lite.duckduckgo.com/lite/",
             params={"q": query},
             headers=_DDG_HEADERS,
             timeout=15,
         )
         resp.raise_for_status()
+        urls = _parse_ddg_html(resp.text)
+        print(f"    DDG lite returned {len(urls)} URLs for: {query[:60]}", file=sys.stderr)
+        return urls
     except Exception as e:
-        print(f"    DDG search failed for '{query[:60]}': {e}", file=sys.stderr)
+        print(f"    DDG lite failed for '{query[:60]}': {e}", file=sys.stderr)
         return []
 
-    soup = BeautifulSoup(resp.text, "lxml")
-    urls, seen = [], set()
-    for a in soup.select("a.result__a"):
-        href = a.get("href", "")
-        # DDG wraps URLs: //duckduckgo.com/l/?uddg=<encoded_url>&...
-        if "uddg=" in href:
-            actual = unquote(href.split("uddg=")[1].split("&")[0])
-        elif href.startswith("http"):
-            actual = href
-        else:
-            continue
-        if actual.startswith("http") and "duckduckgo.com" not in actual and actual not in seen:
-            seen.add(actual)
-            urls.append(actual)
-            if len(urls) >= max_results:
-                break
 
-    print(f"    DDG returned {len(urls)} URLs for: {query[:60]}", file=sys.stderr)
-    return urls
-
-
-def _crunchbase_urls(company_name: str, domain: str) -> list[str]:
-    """
-    Build candidate Crunchbase organization page URLs directly from
-    the company name and domain — no search engine needed.
-    """
-    name_slug = re.sub(r"[^a-z0-9]+", "-", company_name.lower()).strip("-")
-    domain_slug = domain.split(".")[0]
-    slugs = list(dict.fromkeys([name_slug, domain_slug]))  # deduped, name first
-    return [f"https://www.crunchbase.com/organization/{s}" for s in slugs]
 
 
 _FALLBACK_SUBPAGES = ["/about", "/team", "/leadership", "/people", "/about-us"]
@@ -567,9 +577,10 @@ def get_ceo_info(
         except Exception:
             continue
 
-    # ── Step 3: Crunchbase (direct URL, no search engine) ──────────────────
-    print(f"    [Step 3] Trying Crunchbase for {domain}...", file=sys.stderr)
-    for url in _crunchbase_urls(company_name, domain):
+    # ── Step 3: DuckDuckGo search for company name + CEO ──────────────────
+    print(f"    [Step 3] DDG search for '{company_name} CEO'...", file=sys.stderr)
+    step3_urls = _ddg_result_urls(f'"{company_name}" CEO', max_results=3)
+    for url in step3_urls:
         try:
             text = _fetch_text(url)
             first, last = _extract_ceo(text, domain, client)
