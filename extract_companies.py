@@ -381,14 +381,6 @@ _ABOUT_LINK_PATTERN = re.compile(
 )
 
 
-def _fetch_text(url: str) -> str:
-    """Fetch a URL with Playwright and return plain text."""
-    html = _fetch_with_playwright(url, fast=True)
-    soup = BeautifulSoup(html, "lxml")
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    return soup.get_text(separator="\n", strip=True)
-
 
 
 
@@ -396,34 +388,39 @@ _SUBPAGES_TO_TRY = [
     "/about", "/team", "/leadership", "/people", "/about-us",
     "/our-team", "/company", "/who-we-are", "/about/team",
     "/about/leadership", "/company/team", "/company/about",
-    "/en/about", "/en/team",
 ]
 
+_MIN_PAGE_TEXT = 200  # chars — anything shorter is likely a 404/redirect
 
-def _find_pages_to_check(company_url: str) -> list[str]:
+
+def _html_to_text(html: str) -> str:
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    return soup.get_text(separator="\n", strip=True)
+
+
+def get_ceo_info(
+    company_url: str, company_name: str, client: anthropic.Anthropic
+) -> tuple[str, str]:
     """
-    Fetch the homepage and collect every URL worth checking for CEO info:
-    1. The homepage itself
-    2. Any About/Team links found in the nav/body
-    3. All common subpath guesses (always included, not just as fallback)
-    Returns a deduped ordered list.
+    Find the CEO by crawling the company's own website.
+    Fetches the homepage once, checks it for CEO info and nav links,
+    then checks subpages (nav links first, then common fallback paths).
     """
+    domain = re.sub(r"^https?://(www\.)?", "", company_url).split("/")[0]
     base = company_url.rstrip("/")
-    seen = set()
-    pages = []
 
-    def _add(url: str):
-        if url not in seen:
-            seen.add(url)
-            pages.append(url)
-
-    # Always check the homepage itself first
-    _add(company_url)
-
-    # Crawl homepage for nav/body About/Team links
+    # Fetch homepage once with fast=True (nav is in initial HTML for most sites)
+    homepage_text = ""
+    nav_links = []
     try:
-        html = _fetch_with_playwright(company_url, fast=False)
-        soup = BeautifulSoup(html, "lxml")
+        homepage_html = _fetch_with_playwright(company_url, fast=True)
+        homepage_text = _html_to_text(homepage_html)
+
+        # Extract About/Team nav links from the homepage HTML we already have
+        soup = BeautifulSoup(homepage_html, "lxml")
+        seen = {company_url}
         for a in soup.find_all("a", href=True):
             text = a.get_text(strip=True)
             href = a["href"].strip()
@@ -431,34 +428,47 @@ def _find_pages_to_check(company_url: str) -> list[str]:
                 continue
             if _ABOUT_LINK_PATTERN.search(text) or _ABOUT_LINK_PATTERN.search(href):
                 full = urljoin(company_url, href)
-                if full.startswith(base):  # stay on same domain
-                    _add(full)
-    except Exception:
-        pass
+                if full.startswith(base) and full not in seen:
+                    seen.add(full)
+                    nav_links.append(full)
+    except Exception as e:
+        print(f"    Could not load homepage for {domain}: {e}", file=sys.stderr)
 
-    # Always append common subpaths — they often exist even without nav links
-    for path in _SUBPAGES_TO_TRY:
-        _add(base + path)
+    # Build page list: homepage text first, then nav links, then fallback subpaths
+    # (subpaths not already found via nav)
+    subpath_urls = [base + p for p in _SUBPAGES_TO_TRY
+                    if base + p not in (nav_links + [company_url])]
+    print(f"    {domain}: homepage + {len(nav_links)} nav links + {len(subpath_urls)} subpaths",
+          file=sys.stderr)
 
-    return pages
+    # 1. Check homepage text first (no extra fetch needed)
+    if homepage_text and len(homepage_text) >= _MIN_PAGE_TEXT:
+        first, last = _extract_ceo(homepage_text, domain, client)
+        if first or last:
+            print(f"    CEO found on homepage: {first} {last}", file=sys.stderr)
+            return first, last
 
-
-def get_ceo_info(
-    company_url: str, company_name: str, client: anthropic.Anthropic
-) -> tuple[str, str]:
-    """
-    Find the CEO by crawling the company's own website:
-    checks the homepage, any About/Team links found in the nav,
-    and a broad set of common subpaths.
-    """
-    domain = re.sub(r"^https?://(www\.)?", "", company_url).split("/")[0]
-
-    pages = _find_pages_to_check(company_url)
-    print(f"    Checking {len(pages)} pages on {domain}...", file=sys.stderr)
-
-    for url in pages:
+    # 2. Check nav-linked About/Team pages
+    for url in nav_links:
         try:
-            text = _fetch_text(url)
+            html = _fetch_with_playwright(url, fast=True)
+            text = _html_to_text(html)
+            if len(text) < _MIN_PAGE_TEXT:
+                continue  # likely 404
+            first, last = _extract_ceo(text, domain, client)
+            if first or last:
+                print(f"    CEO found at {url}: {first} {last}", file=sys.stderr)
+                return first, last
+        except Exception:
+            continue
+
+    # 3. Try fallback subpaths
+    for url in subpath_urls:
+        try:
+            html = _fetch_with_playwright(url, fast=True)
+            text = _html_to_text(html)
+            if len(text) < _MIN_PAGE_TEXT:
+                continue  # likely 404
             first, last = _extract_ceo(text, domain, client)
             if first or last:
                 print(f"    CEO found at {url}: {first} {last}", file=sys.stderr)
