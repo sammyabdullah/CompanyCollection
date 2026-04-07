@@ -406,9 +406,10 @@ def _extract_ceo(text: str, domain: str, client: anthropic.Anthropic) -> tuple[s
 
 {text[:5000]}
 
-Does this text explicitly name a CEO or Chief Executive Officer?
+Does this text explicitly name a CEO or Chief Executive Officer of {domain}?
 - If YES: return their name exactly as written on the page.
 - If NO: return empty strings. Do NOT guess, infer, or use outside knowledge.
+- IMPORTANT: ignore anyone mentioned as an investor, advisor, board member, or partner — only return the CEO of {domain} itself.
 
 Return ONLY: {{"first_name": "...", "last_name": "..."}}"""
 
