@@ -534,6 +534,13 @@ def _domain_matches_company(company_name: str, domain: str) -> bool:
     return url.split("/")[0]
 
 
+def clean_url(url: str) -> str:
+    """Strip protocol/www and return only the domain (stop at first '/')."""
+    url = re.sub(r"^https?://", "", url)
+    url = re.sub(r"^www\.", "", url)
+    return url.split("/")[0]
+
+
 def deduplicate(companies: list[dict]) -> list[dict]:
     """Remove duplicate company URLs, keeping the first occurrence."""
     seen_urls = set()
