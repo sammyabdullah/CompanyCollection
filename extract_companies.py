@@ -66,7 +66,12 @@ def _fetch_with_playwright(url: str, fast: bool = False) -> str:
         if fast:
             page.goto(url, wait_until="domcontentloaded", timeout=20000)
         else:
-            page.goto(url, wait_until="networkidle", timeout=45000)
+            # Use "load" instead of "networkidle" — SPAs (e.g. YC) fire continuous
+            # XHR requests so networkidle never triggers within the timeout.
+            page.goto(url, wait_until="load", timeout=60000)
+
+            # Give the JS framework time to render initial results
+            page.wait_for_timeout(3000)
 
             # Scroll incrementally to trigger lazy-loading on portfolio pages
             for _ in range(20):
@@ -80,11 +85,8 @@ def _fetch_with_playwright(url: str, fast: bool = False) -> str:
                 page.evaluate("window.scrollBy(0, window.innerHeight)")
                 page.wait_for_timeout(400)
 
-            # Final wait for any network activity triggered by scrolling
-            try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                pass
+            # Final wait for any remaining async renders
+            page.wait_for_timeout(2000)
 
         html = page.content()
         browser.close()
