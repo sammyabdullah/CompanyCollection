@@ -387,9 +387,7 @@ _ABOUT_LINK_PATTERN = re.compile(
 
 
 _SUBPAGES_TO_TRY = [
-    "/about", "/team", "/leadership", "/people", "/about-us",
-    "/our-team", "/company", "/who-we-are", "/about/team",
-    "/about/leadership", "/company/team", "/company/about",
+    "/about", "/team", "/leadership", "/about-us",
 ]
 
 _MIN_PAGE_TEXT = 200  # chars — anything shorter is likely a 404/redirect
@@ -457,7 +455,7 @@ def get_ceo_info(
                 continue
             if _ABOUT_LINK_PATTERN.search(text) or _ABOUT_LINK_PATTERN.search(href):
                 full = urljoin(company_url, href)
-                if full.startswith(base) and full not in seen:
+                if full.startswith(base) and full not in seen and len(nav_links) < 3:
                     seen.add(full)
                     nav_links.append(full)
     except Exception as e:
