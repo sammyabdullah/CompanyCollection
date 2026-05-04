@@ -189,7 +189,7 @@ If you cannot determine it, return {{"url": ""}}"""
 
     response = call_claude_with_retry(
         client,
-        model="claude-opus-4-6",
+        model="claude-haiku-4-5-20251001",
         max_tokens=256,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -238,7 +238,7 @@ Respond with the JSON array only — no explanation, no markdown fences."""
 
     response = call_claude_with_retry(
         client,
-        model="claude-opus-4-6",
+        model="claude-haiku-4-5-20251001",
         max_tokens=4096,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -308,7 +308,7 @@ Respond with the JSON array only — no explanation, no markdown fences."""
 
     response = call_claude_with_retry(
         client,
-        model="claude-opus-4-6",
+        model="claude-sonnet-4-6",
         max_tokens=8192,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -406,7 +406,7 @@ def _extract_ceo(text: str, domain: str, client: anthropic.Anthropic) -> tuple[s
     """Ask Claude to find the CEO name in text. Returns ('', '') if not found."""
     prompt = f"""Below is text scraped from a single webpage. Read it carefully.
 
-{text[:5000]}
+{text[:2000]}
 
 Does this text explicitly name a CEO or Chief Executive Officer of {domain}?
 - If YES: return their name exactly as written on the page.
@@ -417,7 +417,7 @@ Return ONLY: {{"first_name": "...", "last_name": "..."}}"""
 
     response = call_claude_with_retry(
         client,
-        model="claude-opus-4-6",
+        model="claude-haiku-4-5-20251001",
         max_tokens=128,
         messages=[{"role": "user", "content": prompt}],
     )
