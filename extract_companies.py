@@ -254,7 +254,7 @@ Page text (truncated):
 {page_text[:4000]}
 
 Links found on the page (url | link text):
-{chr(10).join(f"{l['url']} | {l['text']}" for l in links[:150])}
+{chr(10).join(f"{l['url']} | {l['text']}" for l in links[:250])}
 
 Task: Identify every tech company or startup listed or mentioned on this page as a subject of interest
 (e.g. portfolio companies, investees, featured startups, ranked companies, profiled businesses, etc.).
@@ -280,7 +280,7 @@ Respond with the JSON array only — no explanation, no markdown fences."""
     response = call_claude_with_retry(
         client,
         model="claude-sonnet-4-6",
-        max_tokens=4096,
+        max_tokens=8192,
         messages=[{"role": "user", "content": prompt}],
     )
 
@@ -372,10 +372,9 @@ def _extract_ceo(text: str, domain: str, client: anthropic.Anthropic) -> tuple[s
 
 {text[:4000]}
 
-Does this text explicitly name a CEO or Chief Executive Officer of {domain}?
+Does this text name the CEO of {domain}? Look for any of these titles: CEO, Chief Executive Officer, Founder & CEO, Co-founder & CEO, Co-CEO.
 - If YES: return their name exactly as written on the page.
-- If NO: return empty strings. Do NOT guess, infer, or use outside knowledge.
-- IMPORTANT: ignore anyone mentioned as an investor, advisor, board member, or partner — only return the CEO of {domain} itself.
+- If NO (title not present or person is only an investor/advisor/board member): return empty strings. Do NOT guess or use outside knowledge.
 
 Return ONLY: {{"first_name": "...", "last_name": "..."}}"""
 
@@ -390,7 +389,6 @@ Return ONLY: {{"first_name": "...", "last_name": "..."}}"""
     if isinstance(data, dict):
         return data.get("first_name", ""), data.get("last_name", "")
     return "", ""
-    return soup.get_text(separator="\n", strip=True)
 
 
 def _lookup_wikipedia_ceo(company_name: str, client: anthropic.Anthropic) -> tuple[str, str]:
@@ -474,13 +472,13 @@ def get_ceo_info(
     # Fetch subpages and collect usable text
     page_texts = []
     if homepage_text and len(homepage_text) >= _MIN_PAGE_TEXT:
-        page_texts.append(homepage_text[:1000])
+        page_texts.append(homepage_text[:1500])
     for url in candidates:
         try:
             html = _fetch_with_playwright(url, fast=True)
             text = _html_to_text(html)
             if len(text) >= _MIN_PAGE_TEXT:
-                page_texts.append(text[:1000])
+                page_texts.append(text[:1500])
         except Exception:
             continue
 
@@ -516,12 +514,6 @@ def _domain_matches_company(company_name: str, domain: str) -> bool:
     if not name_words:
         return True  # can't determine, assume OK
     return bool(name_words & domain_words) or any(w in domain_clean for w in name_words)
-
-
-    """Strip protocol/www and return only the domain (stop at first '/')."""
-    url = re.sub(r"^https?://", "", url)
-    url = re.sub(r"^www\.", "", url)
-    return url.split("/")[0]
 
 
 def clean_url(url: str) -> str:
