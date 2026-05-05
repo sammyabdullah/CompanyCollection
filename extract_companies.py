@@ -20,9 +20,7 @@ import os
 import re
 import sys
 import time
-from urllib.parse import urljoin, quote
-
-import requests
+from urllib.parse import urljoin
 
 import anthropic
 from bs4 import BeautifulSoup
@@ -343,20 +341,9 @@ def call_claude_with_retry(client: anthropic.Anthropic, max_retries: int = 4, **
             time.sleep(wait)
 
 
-_ABOUT_LINK_PATTERN = re.compile(
-    r"\b(about|team|leadership|people|founders?|executives?|management|staff|who we are)\b",
-    re.IGNORECASE,
-)
+_CEO_PAGES = ["/about", "/about-us", "/team", "/leadership", "/people"]
 
-
-
-
-
-_SUBPAGES_TO_TRY = [
-    "/about", "/team", "/leadership", "/about-us",
-]
-
-_MIN_PAGE_TEXT = 200  # chars — anything shorter is likely a 404/redirect
+_MIN_PAGE_TEXT = 200  # chars -- anything shorter is likely a 404/redirect
 
 
 def _html_to_text(html: str) -> str:
@@ -366,133 +353,55 @@ def _html_to_text(html: str) -> str:
     return soup.get_text(separator="\n", strip=True)
 
 
-def _extract_ceo(text: str, domain: str, client: anthropic.Anthropic) -> tuple[str, str]:
-    """Ask Claude to find the CEO name in text. Returns ('', '') if not found."""
-    prompt = f"""Below is text scraped from a single webpage. Read it carefully.
+def _find_ceo_in_text(text: str) -> tuple[str, str]:
+    """Regex-based CEO name extraction. Returns (\'\', \'\') if CEO not found."""
+    if "CEO" not in text:
+        return "", ""
 
-{text[:4000]}
+    NAME = r'[A-Z][a-z]+(?:[ \-][A-Z][a-z]+)+'
 
-Does this text name the CEO of {domain}? Look for any of these titles: CEO, Chief Executive Officer, Founder & CEO, Co-founder & CEO, Co-CEO.
-- If YES: return their name exactly as written on the page.
-- If NO (title not present or person is only an investor/advisor/board member): return empty strings. Do NOT guess or use outside knowledge.
+    patterns = [
+        # "Jane Smith, CEO" / "Jane Smith - CEO" / "Jane Smith | CEO"
+        rf'({NAME})\s*[,\-/|]\s*(?:\w+\s+)?CEO\b',
+        # "CEO: Jane Smith" / "CEO - Jane Smith"
+        rf'\bCEO\s*[:\-]\s*({NAME})',
+        # "Jane Smith\nCEO"  (name on line above title)
+        rf'({NAME})\n[^\n]{{0,30}}CEO\b',
+        # "CEO\nJane Smith"  (title on line above name)
+        rf'\bCEO\b[^\n]{{0,30}}\n({NAME})',
+    ]
 
-Return ONLY: {{"first_name": "...", "last_name": "..."}}"""
+    for pattern in patterns:
+        m = re.search(pattern, text, re.MULTILINE)
+        if m:
+            name = m.group(1).strip()
+            parts = name.split()
+            return parts[0], parts[-1] if len(parts) > 1 else ""
 
-    response = call_claude_with_retry(
-        client,
-        model="claude-haiku-4-5-20251001",
-        max_tokens=128,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = next((b.text for b in response.content if b.type == "text"), "{}")
-    data = extract_json(raw, array=False)
-    if isinstance(data, dict):
-        return data.get("first_name", ""), data.get("last_name", "")
     return "", ""
 
 
-def _lookup_wikipedia_ceo(company_name: str, client: anthropic.Anthropic) -> tuple[str, str]:
-    """Try Wikipedia's summary API for a free, no-Playwright CEO lookup.
-
-    Makes one HTTP request per candidate name. Only calls Claude if the
-    Wikipedia extract actually mentions a CEO — otherwise returns ('', '').
-    """
-    candidates = [company_name]
-    # Also try just the first word: "Acme Health" -> "Acme"
-    first_word = company_name.split()[0] if company_name else ""
-    if first_word and first_word.lower() != company_name.lower():
-        candidates.append(first_word)
-
-    for term in candidates:
-        try:
-            resp = requests.get(
-                f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(term)}",
-                timeout=5,
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            if resp.status_code != 200:
-                continue
-            extract = resp.json().get("extract", "")
-            if not extract:
-                continue
-            if not re.search(r"\bCEO\b|chief executive", extract, re.IGNORECASE):
-                continue
-            first, last = _extract_ceo(extract, company_name, client)
-            if first or last:
-                return first, last
-        except Exception:
-            continue
-    return "", ""
-
-
-def get_ceo_info(
-    company_url: str, company_name: str, client: anthropic.Anthropic
-) -> tuple[str, str]:
-    """
-    Find the CEO by crawling the company's own website.
-    Fetches homepage + up to 2 subpages, concatenates their text, and
-    makes a single Claude call instead of one call per page.
-    """
+def get_ceo_info(company_url: str, company_name: str) -> tuple[str, str]:
+    """Fetch About/Team pages and regex-search for the CEO name."""
     domain = re.sub(r"^https?://(www\.)?", "", company_url).split("/")[0]
     base = company_url.rstrip("/")
 
-    # Step 0: Wikipedia — free, no Playwright, no Claude if text has no CEO mention
-    first, last = _lookup_wikipedia_ceo(company_name, client)
-    if first or last:
-        print(f"    CEO found via Wikipedia: {first} {last}", file=sys.stderr)
-        return first, last
-
-    # Fetch homepage; extract nav links from the HTML while we have it
-    homepage_text = ""
-    nav_links = []
-    try:
-        homepage_html = _fetch_with_playwright(company_url, fast=True)
-        homepage_text = _html_to_text(homepage_html)
-        soup = BeautifulSoup(homepage_html, "lxml")
-        seen = {company_url}
-        for a in soup.find_all("a", href=True):
-            text = a.get_text(strip=True)
-            href = a["href"].strip()
-            if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
-                continue
-            if _ABOUT_LINK_PATTERN.search(text) or _ABOUT_LINK_PATTERN.search(href):
-                full = urljoin(company_url, href)
-                if full.startswith(base) and full not in seen and len(nav_links) < 3:
-                    seen.add(full)
-                    nav_links.append(full)
-    except Exception as e:
-        print(f"    Could not load homepage for {domain}: {e}", file=sys.stderr)
-
-    # Pick up to 2 subpages to fetch: nav links first, then fallback paths
-    subpath_urls = [base + p for p in _SUBPAGES_TO_TRY
-                    if base + p not in (nav_links + [company_url])]
-    candidates = (nav_links + subpath_urls)[:2]
-    print(f"    {domain}: homepage + {len(candidates)} subpages -> 1 Claude call", file=sys.stderr)
-
-    # Fetch subpages and collect usable text
-    page_texts = []
-    if homepage_text and len(homepage_text) >= _MIN_PAGE_TEXT:
-        page_texts.append(homepage_text[:1500])
-    for url in candidates:
+    for path in _CEO_PAGES:
+        url = base + path
         try:
             html = _fetch_with_playwright(url, fast=True)
             text = _html_to_text(html)
-            if len(text) >= _MIN_PAGE_TEXT:
-                page_texts.append(text[:1500])
+            if len(text) < _MIN_PAGE_TEXT or "CEO" not in text:
+                continue
+            first, last = _find_ceo_in_text(text)
+            if first:
+                print(f"    CEO found at {url}: {first} {last}", file=sys.stderr)
+                return first, last
         except Exception:
             continue
 
-    if not page_texts:
-        print(f"    No CEO found for {domain}", file=sys.stderr)
-        return "", ""
-
-    combined = "\n---\n".join(page_texts)
-    first, last = _extract_ceo(combined, domain, client)
-    if first or last:
-        print(f"    CEO found: {first} {last}", file=sys.stderr)
-    else:
-        print(f"    No CEO found for {domain}", file=sys.stderr)
-    return first, last
+    print(f"    No CEO found for {domain}", file=sys.stderr)
+    return "", ""
 
 
 def _domain_matches_company(company_name: str, domain: str) -> bool:
@@ -640,7 +549,7 @@ def main():
                       f"(domain mismatch: {domain})", file=sys.stderr)
             elif not args.no_ceo and url:
                 print(f"  [{i}/{len(all_companies)}] Looking up CEO for {name}...")
-                first, last = get_ceo_info(url, name, client)
+                first, last = get_ceo_info(url, name)
                 if first and not last:
                     notes = "first_name_only"
 
