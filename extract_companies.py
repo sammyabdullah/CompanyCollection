@@ -219,37 +219,6 @@ def _resolve_detail_pages(
     return results
 
 
-def _resolve_name_only(
-    name_only: list[dict], client: anthropic.Anthropic
-) -> list[dict]:
-    """Ask Claude to supply website URLs for companies identified by name only (no links on page)."""
-    names = [c["company_name"] for c in name_only]
-    prompt = f"""For each of the following tech companies, provide their primary website URL.
-
-Companies:
-{json.dumps(names, indent=2)}
-
-Return ONLY a JSON array. Each element must have:
-  - "company_name": exactly as given above
-  - "company_url": the company's homepage URL (e.g. "https://stripe.com")
-
-If you don't know the URL for a company, omit it from the array.
-Respond with the JSON array only — no explanation, no markdown fences."""
-
-    response = call_claude_with_retry(
-        client,
-        model="claude-haiku-4-5-20251001",
-        max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = next((b.text for b in response.content if b.type == "text"), "[]")
-    result = extract_json(raw, array=True)
-    if not isinstance(result, list):
-        return []
-    resolved = [c for c in result if c.get("company_name") and c.get("company_url")]
-    for c in resolved:
-        print(f"    {c['company_name']} -> {c['company_url']}", file=sys.stderr)
-    return resolved
 
 
 def identify_tech_companies(
@@ -280,10 +249,10 @@ def identify_tech_companies(
     prompt = f"""You are a research assistant. I have a web page that lists tech companies.
 
 Page text (truncated):
-{page_text[:6000]}
+{page_text[:4000]}
 
-All links found on the page (up to 300):
-{json.dumps(links[:300], indent=2)}
+Links found on the page (url | link text):
+{chr(10).join(f"{l['url']} | {l['text']}" for l in links[:150])}
 
 Task: Identify every tech company or startup listed or mentioned on this page as a subject of interest
 (e.g. portfolio companies, investees, featured startups, ranked companies, profiled businesses, etc.).
@@ -309,7 +278,7 @@ Respond with the JSON array only — no explanation, no markdown fences."""
     response = call_claude_with_retry(
         client,
         model="claude-sonnet-4-6",
-        max_tokens=8192,
+        max_tokens=4096,
         messages=[{"role": "user", "content": prompt}],
     )
 
@@ -322,21 +291,16 @@ Respond with the JSON array only — no explanation, no markdown fences."""
     if not isinstance(result, list):
         return []
 
-    # Split into direct hits, detail pages needing follow-up, and name-only (TYPE C)
+    # Split into direct hits and detail pages needing follow-up; skip name-only (TYPE C)
     direct = [c for c in result if c.get("company_url")]
     needs_detail = [c for c in result if not c.get("company_url") and c.get("detail_url")]
-    name_only = [c for c in result if not c.get("company_url") and not c.get("detail_url") and c.get("company_name")]
     if debug:
-        print(f"[DEBUG] Claude identified {len(direct)} direct URLs, {len(needs_detail)} detail pages, {len(name_only)} name-only", file=sys.stderr)
+        name_only_count = sum(1 for c in result if not c.get("company_url") and not c.get("detail_url") and c.get("company_name"))
+        print(f"[DEBUG] Claude identified {len(direct)} direct URLs, {len(needs_detail)} detail pages, {name_only_count} name-only (skipped)", file=sys.stderr)
 
     if needs_detail:
         print(f"  Following {len(needs_detail)} company detail pages...", file=sys.stderr)
         resolved = _resolve_detail_pages(needs_detail, base_host, source_label, client)
-        direct.extend(resolved)
-
-    if name_only:
-        print(f"  Looking up URLs for {len(name_only)} name-only companies via Claude...", file=sys.stderr)
-        resolved = _resolve_name_only(name_only, client)
         direct.extend(resolved)
 
     # Normalise: drop detail_url key from output
@@ -432,20 +396,18 @@ def get_ceo_info(
 ) -> tuple[str, str]:
     """
     Find the CEO by crawling the company's own website.
-    Fetches the homepage once, checks it for CEO info and nav links,
-    then checks subpages (nav links first, then common fallback paths).
+    Fetches homepage + up to 2 subpages, concatenates their text, and
+    makes a single Claude call instead of one call per page.
     """
     domain = re.sub(r"^https?://(www\.)?", "", company_url).split("/")[0]
     base = company_url.rstrip("/")
 
-    # Fetch homepage once with fast=True (nav is in initial HTML for most sites)
+    # Fetch homepage; extract nav links from the HTML while we have it
     homepage_text = ""
     nav_links = []
     try:
         homepage_html = _fetch_with_playwright(company_url, fast=True)
         homepage_text = _html_to_text(homepage_html)
-
-        # Extract About/Team nav links from the homepage HTML we already have
         soup = BeautifulSoup(homepage_html, "lxml")
         seen = {company_url}
         for a in soup.find_all("a", href=True):
@@ -461,50 +423,36 @@ def get_ceo_info(
     except Exception as e:
         print(f"    Could not load homepage for {domain}: {e}", file=sys.stderr)
 
-    # Build page list: homepage text first, then nav links, then fallback subpaths
-    # (subpaths not already found via nav)
+    # Pick up to 2 subpages to fetch: nav links first, then fallback paths
     subpath_urls = [base + p for p in _SUBPAGES_TO_TRY
                     if base + p not in (nav_links + [company_url])]
-    print(f"    {domain}: homepage + {len(nav_links)} nav links + {len(subpath_urls)} subpaths",
-          file=sys.stderr)
+    candidates = (nav_links + subpath_urls)[:2]
+    print(f"    {domain}: homepage + {len(candidates)} subpages -> 1 Claude call", file=sys.stderr)
 
-    # 1. Check homepage text first (no extra fetch needed)
+    # Fetch subpages and collect usable text
+    page_texts = []
     if homepage_text and len(homepage_text) >= _MIN_PAGE_TEXT:
-        first, last = _extract_ceo(homepage_text, domain, client)
-        if first or last:
-            print(f"    CEO found on homepage: {first} {last}", file=sys.stderr)
-            return first, last
-
-    # 2. Check nav-linked About/Team pages
-    for url in nav_links:
+        page_texts.append(homepage_text[:1000])
+    for url in candidates:
         try:
             html = _fetch_with_playwright(url, fast=True)
             text = _html_to_text(html)
-            if len(text) < _MIN_PAGE_TEXT:
-                continue  # likely 404
-            first, last = _extract_ceo(text, domain, client)
-            if first or last:
-                print(f"    CEO found at {url}: {first} {last}", file=sys.stderr)
-                return first, last
+            if len(text) >= _MIN_PAGE_TEXT:
+                page_texts.append(text[:1000])
         except Exception:
             continue
 
-    # 3. Try fallback subpaths
-    for url in subpath_urls:
-        try:
-            html = _fetch_with_playwright(url, fast=True)
-            text = _html_to_text(html)
-            if len(text) < _MIN_PAGE_TEXT:
-                continue  # likely 404
-            first, last = _extract_ceo(text, domain, client)
-            if first or last:
-                print(f"    CEO found at {url}: {first} {last}", file=sys.stderr)
-                return first, last
-        except Exception:
-            continue
+    if not page_texts:
+        print(f"    No CEO found for {domain}", file=sys.stderr)
+        return "", ""
 
-    print(f"    No CEO found for {domain}", file=sys.stderr)
-    return "", ""
+    combined = "\n---\n".join(page_texts)
+    first, last = _extract_ceo(combined, domain, client)
+    if first or last:
+        print(f"    CEO found: {first} {last}", file=sys.stderr)
+    else:
+        print(f"    No CEO found for {domain}", file=sys.stderr)
+    return first, last
 
 
 def _domain_matches_company(company_name: str, domain: str) -> bool:
