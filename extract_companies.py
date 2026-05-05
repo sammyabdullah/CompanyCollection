@@ -20,7 +20,9 @@ import os
 import re
 import sys
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote
+
+import requests
 
 import anthropic
 from bs4 import BeautifulSoup
@@ -368,7 +370,7 @@ def _extract_ceo(text: str, domain: str, client: anthropic.Anthropic) -> tuple[s
     """Ask Claude to find the CEO name in text. Returns ('', '') if not found."""
     prompt = f"""Below is text scraped from a single webpage. Read it carefully.
 
-{text[:2000]}
+{text[:4000]}
 
 Does this text explicitly name a CEO or Chief Executive Officer of {domain}?
 - If YES: return their name exactly as written on the page.
@@ -391,6 +393,40 @@ Return ONLY: {{"first_name": "...", "last_name": "..."}}"""
     return soup.get_text(separator="\n", strip=True)
 
 
+def _lookup_wikipedia_ceo(company_name: str, client: anthropic.Anthropic) -> tuple[str, str]:
+    """Try Wikipedia's summary API for a free, no-Playwright CEO lookup.
+
+    Makes one HTTP request per candidate name. Only calls Claude if the
+    Wikipedia extract actually mentions a CEO — otherwise returns ('', '').
+    """
+    candidates = [company_name]
+    # Also try just the first word: "Acme Health" -> "Acme"
+    first_word = company_name.split()[0] if company_name else ""
+    if first_word and first_word.lower() != company_name.lower():
+        candidates.append(first_word)
+
+    for term in candidates:
+        try:
+            resp = requests.get(
+                f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(term)}",
+                timeout=5,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if resp.status_code != 200:
+                continue
+            extract = resp.json().get("extract", "")
+            if not extract:
+                continue
+            if not re.search(r"\bCEO\b|chief executive", extract, re.IGNORECASE):
+                continue
+            first, last = _extract_ceo(extract, company_name, client)
+            if first or last:
+                return first, last
+        except Exception:
+            continue
+    return "", ""
+
+
 def get_ceo_info(
     company_url: str, company_name: str, client: anthropic.Anthropic
 ) -> tuple[str, str]:
@@ -401,6 +437,12 @@ def get_ceo_info(
     """
     domain = re.sub(r"^https?://(www\.)?", "", company_url).split("/")[0]
     base = company_url.rstrip("/")
+
+    # Step 0: Wikipedia — free, no Playwright, no Claude if text has no CEO mention
+    first, last = _lookup_wikipedia_ceo(company_name, client)
+    if first or last:
+        print(f"    CEO found via Wikipedia: {first} {last}", file=sys.stderr)
+        return first, last
 
     # Fetch homepage; extract nav links from the HTML while we have it
     homepage_text = ""
